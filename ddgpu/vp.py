@@ -104,7 +104,7 @@ class VPSchedule:
         ls = self.log_sigmas[i0] * (1 - w) + self.log_sigmas[i0 + 1] * w
         return ls.exp().float()
 
-    def student_sigmas(self, n_steps, t_max=None):
+    def student_sigmas(self, n_steps, sigma_max=None):
         """Backward-Euler sampling grid for an n-step student, in sigma space.
 
         DMD2's few-step ImageNet student uses the evenly spaced timesteps
@@ -112,8 +112,12 @@ class VPSchedule:
         what this reproduces -- *not* an EDM rho=7 grid, because the student was
         initialised from a VP teacher and its useful noise levels are the ones
         that teacher was trained on. Returns n_steps+1 values ending at 0.
+
+        Signature matches `interpolant.LinearInterpolant.student_sigmas` so the
+        trainer and the sampler can call either without branching.
         """
-        t_max = self.T - 1 if t_max is None else t_max
+        t_max = (self.T - 1 if sigma_max is None
+                 else float(self.t_of_sigma(torch.tensor([float(sigma_max)]))[0]))
         ts = [t_max - i * (t_max + 1) / n_steps for i in range(n_steps)]
         s = self.sigma_of_t(torch.tensor(ts, dtype=torch.float64))
         return torch.cat([s, torch.zeros(1, device=s.device, dtype=s.dtype)])
@@ -191,6 +195,8 @@ def make_sigma_sampler(cfg, schedule=None):
 
     'lognormal'    : EDM's `exp(N(P_mean, P_std))`. Calibrated for sigma_data
                      ~0.5; the default for EDM-preconditioned runs.
+    'interp_uniform_t' : uniform over the linear-interpolant time t, which is
+                     what SiT/flow-matching models are trained with.
     'vp_uniform_t' : uniform over an integer timestep window, mapped to sigma.
                      This is what DMD2 does, and it is the right choice for a VP
                      teacher: it puts mass where that teacher was actually
@@ -201,6 +207,17 @@ def make_sigma_sampler(cfg, schedule=None):
     if dist == "lognormal":
         P_mean, P_std = cfg["P_mean"], cfg["P_std"]
         return lambda n, device: (torch.randn(n, device=device) * P_std + P_mean).exp()
+    if dist == "interp_uniform_t":
+        # SiT / flow matching trains with t ~ U[0,1] on the linear interpolant,
+        # so this is the matched choice there. `t_lo`/`t_hi` trim the ends, which
+        # are sigma=0 and sigma=inf and representable at neither.
+        assert schedule is not None, "interp_uniform_t needs a LinearInterpolant"
+        lo, hi = float(cfg.get("t_lo", 0.02)), float(cfg.get("t_hi", 0.98))
+
+        def f(n, device):
+            t = torch.rand(n, device=device) * (hi - lo) + lo
+            return (t / (1.0 - t)).to(device)
+        return f
     if dist == "vp_uniform_t":
         assert schedule is not None, "vp_uniform_t needs a VPSchedule"
         lo = int(cfg.get("t_min", 20))

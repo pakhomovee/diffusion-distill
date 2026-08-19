@@ -37,6 +37,11 @@ BASE = dict(
     log_every=50, diag_every=500, probe_every=2500, ckpt_every=5000,
     workers=4, amp=True, flip=False,
     data=None, teacher_ckpt=None, teacher_format="official",
+    # Preferred teacher form: "<family>:<path>" through ddgpu.teachers, which
+    # covers DiT / diffusers / EDM / SiT and clones the student from whatever it
+    # loads. `teacher_ckpt` remains for the pre-registry DiT configs.
+    teacher=None, repa_dir=None, edm_repo=None,
+    validate_teacher=True, strict_teacher=True,
     init_from_teacher=True, out=None,
     gather_real=True,
 )
@@ -68,13 +73,21 @@ def build(a):
     c = dict(BASE)
     c.update(MODES[a.mode])
     for k, v in dict(micro_batch=a.micro_batch, steps=a.steps, data=a.data,
-                     teacher_ckpt=a.teacher, out=a.out, n_classes=a.n_classes,
+                     teacher_ckpt=a.teacher, teacher=a.teacher_spec,
+                     sigma_dist=a.sigma_dist, repa_dir=a.repa_dir,
+                     edm_repo=a.edm_repo,
+                     out=a.out, n_classes=a.n_classes,
                      n_student_steps=a.n_student_steps, cfg_scale=a.cfg_scale,
                      workers=a.workers, seed=a.seed, arch=a.arch,
                      latent_size=a.latent_size).items():
         if v is not None:
             c[k] = v
-    if c["latent_size"] and not c["shape"]:
+    if c["teacher"]:
+        # The teacher determines arch, shape and latent size; leaving them null
+        # keeps a stale config value from overriding a fact about the artefact.
+        c["arch"] = c["latent_size"] = c["shape"] = None
+        c["teacher_ckpt"] = None
+    elif c["latent_size"] and not c["shape"]:
         c["shape"] = [4, c["latent_size"], c["latent_size"]]
     if c["track"] == "B" and a.anchor_path:
         c["anchor_path"] = a.anchor_path
@@ -104,6 +117,12 @@ def main():
     p.add_argument("--workers", type=int, default=None)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--anchor-path", default=None)
+    p.add_argument("--teacher-spec", default=None,
+                   help="'<family>:<path>' for ddgpu.teachers (preferred)")
+    p.add_argument("--sigma-dist", default=None,
+                   help="lognormal | vp_uniform_t | interp_uniform_t")
+    p.add_argument("--repa-dir", default=None)
+    p.add_argument("--edm-repo", default=None)
     p.add_argument("--set", nargs="*", default=[], help="key=json overrides")
     p.add_argument("--write", default=None, help="write here instead of stdout")
     p.add_argument("--print-delta", action="store_true",

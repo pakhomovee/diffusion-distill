@@ -103,6 +103,12 @@ log "Comparison table (matched wall-clock, tol=$TOL):"
 python3 -m ddgpu.eval --records "$RESULTS" --tol "$TOL" || \
   warn "table refused -- see the message above; that is the guard working, not a bug"
 
+# Runs differing only by _sN are seeds of one arm. At CIFAR scale the effect may
+# be smaller than seed variance (FINDINGS.md 6), so the seed-grouped view with
+# its explicit standard-error verdict is the one to read, not the flat table.
+log "Seed-grouped table:"
+python3 -m ddgpu.eval --records "$RESULTS" --tol "$TOL" --seeds || true
+
 if [[ "$SHUTDOWN" == "1" ]]; then
   log "shutting down in ${SHUTDOWN_DELAY:-60}s (Ctrl-C to cancel)"
   sleep "${SHUTDOWN_DELAY:-60}"

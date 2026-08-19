@@ -95,15 +95,19 @@ check_effective_real_batch() {
   else
     log "effective real batch = $eff (micro $micro x $ngpu GPUs) -- ok"
   fi
-  # Second, softer floor. `LambdaEstimator.calibrate` SPLITS the gathered batch:
-  # half supplies calibration points, half supplies B. So the calibration leg's
-  # empirical score sees eff/2, not eff. When that is below the 1.4 floor, the
-  # calibration measures the optimal weight for a WORSE B than training uses,
+  # Second, softer floor, and it is a DIFFERENT threshold on a different
+  # quantity. `LambdaEstimator.calibrate` SPLITS the gathered batch: half
+  # supplies calibration points, half supplies B. So the calibration leg's
+  # empirical score sees eff/2, not eff. When THAT is below the 1.4 floor, the
+  # calibration measures the optimal weight for a worse B than training uses,
   # which biases lambda toward the teacher. Conservative, not catastrophic --
-  # hence a warning rather than a refusal.
+  # hence a warning rather than a refusal. See FINDINGS.md 5.
+  local calib_min="${DD_MIN_CALIB_BATCH:-256}"
   local half=$((eff / 2))
-  if (( half < min )); then
-    warn "lambda calibration sees only $half real samples (half of $eff)."
-    warn "That biases lambda toward the teacher. Prefer effective batch >= $((min * 2))."
+  if (( half < calib_min )); then
+    warn "lambda calibration sees only $half real samples (half of $eff) < $calib_min"
+    warn "That biases lambda toward the teacher. Prefer effective batch >= $((calib_min * 2))."
+  else
+    log "lambda calibration batch = $half -- ok"
   fi
 }

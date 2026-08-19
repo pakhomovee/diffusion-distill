@@ -3,7 +3,7 @@
 # Pre-flight checks. Run this before every long job, and on a fresh box before
 # anything else. Everything here is CPU-safe and finishes in a couple of minutes.
 #
-#   scripts/smoke.sh            # invariant tests + both tracks, 8 steps each
+#   scripts/smoke.sh            # invariant tests + all tracks + Phase A self-test
 #   scripts/smoke.sh --gpu      # additionally probe real VRAM + step time
 #
 # RUNPLAN.md's GPU counts rest on an ANALYTIC activation-memory model. `--gpu`
@@ -24,21 +24,33 @@ export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
 log "1/4  invariant tests"
 python3 tests/test_all.py
 
-log "2/4  pipeline tests (VP preconditioning, checkpoint remap, config wiring)"
+log "2/5  pipeline tests (VP preconditioning, checkpoint remap, config wiring)"
 python3 tests/test_pipeline.py
 
-log "3/4  Track A smoke (8 steps, synthetic latents, CPU)"
+log "3/5  teacher-zoo tests (interpolant math, DSM identity, mis-wrap detection)"
+python3 tests/test_teachers.py
+
+log "4/5  Track A smoke (8 steps, synthetic latents, CPU)"
 python3 -m ddgpu.train --config configs/smokeA.json
 
 log "     Track B smoke (8 steps, synthetic latents, CPU)"
 python3 -m ddgpu.train --config configs/smokeB.json
 
+log "     cheap-tier smoke: registry teacher -> clone -> train, both arms"
+python3 -m ddgpu.train --config configs/smokeC.json
+python3 -m ddgpu.train --config configs/smokeC_dmd2.json
+
+log "     Phase A self-test against a target whose true score is known"
+python3 exp/10_lambda_real.py --teacher "synthetic:c=4,hw=8,sd=0.5,bias=0.15" \
+  --data "gaussian:c=4,hw=8,sd=0.5,n=4096" --batch 128 --batches 3 --n-sigma 5 \
+  --sigma-min 0.05 --sigma-max 8 --tag selftest --out results/lambda_real
+
 if [[ "$DO_GPU" == "1" ]]; then
-  log "4/4  VRAM + throughput probe (this is the number RUNPLAN.md cannot derive)"
+  log "5/5  VRAM + throughput probe (this is the number RUNPLAN.md cannot derive)"
   python3 -m ddgpu.probe --sweep --out results/probe.json
   log "compare results/probe.json against RUNPLAN.md; the probe wins"
 else
-  log "4/4  skipped (pass --gpu on the GPU box to measure VRAM + step time)"
+  log "5/5  skipped (pass --gpu on the GPU box to measure VRAM + step time)"
 fi
 
 log "smoke OK"

@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from .edm import EDMWrapper, dsm_weight, edm_sigmas
 from .vp import make_sigma_sampler
 from .robust import LambdaEstimator, LambdaProbe, robust_real_score
-from .gan import GANHead, d_loss, g_loss
+from .gan import GANHead, ConvGANHead, d_loss, g_loss
 
 
 class DMD2Trainer:
@@ -54,10 +54,20 @@ class DMD2Trainer:
                                        betas=(0.0, 0.999), weight_decay=0.01)
         # DMD2's auxiliary discriminator: a head on the critic's own features.
         # gan_weight = 0 turns it off, which is the Track A configuration.
-        self.gan = None
+        # Two discriminator flavours. DMD2 reuses the critic's own token trunk,
+        # which our DiT exposes as `.trunk()`. Third-party backbones (diffusers
+        # UNets, NVlabs EDM, REPA SiT) do not, so they get a small standalone
+        # conv head instead -- see gan.ConvGANHead for why that is honest rather
+        # than a shortcut.
+        self.gan, self.gan_kind = None, None
         if cfg.get("gan_weight", 0.0) > 0:
-            hid = _raw(critic).net.final.lin.in_features
-            self.gan = GANHead(hid).to(device)
+            base = getattr(_raw(critic), "net", None)
+            if hasattr(base, "trunk") and hasattr(base, "final"):
+                self.gan = GANHead(base.final.lin.in_features).to(device)
+                self.gan_kind = "trunk"
+            else:
+                self.gan = ConvGANHead(cfg["shape"][0], res=cfg["shape"][-1]).to(device)
+                self.gan_kind = "conv"
         params_D = list(self.mu.parameters()) + (
             list(self.gan.parameters()) if self.gan else [])
         self.opt_D = torch.optim.AdamW(params_D, lr=cfg["lr_d"],
@@ -74,11 +84,13 @@ class DMD2Trainer:
         if n <= 1:
             return None
         if self.sch is not None:
-            return self.sch.student_sigmas(n).to(self.dev)
+            return self.sch.student_sigmas(n, sigma_max=self.c["sigma_max"]).to(self.dev)
         return edm_sigmas(n, sigma_max=self.c["sigma_max"], device=self.dev)
 
     def _disc(self, x, sigma, y):
-        """Discriminator logit, reusing the critic trunk."""
+        """Discriminator logit."""
+        if self.gan_kind == "conv":
+            return self.gan(x, sigma)
         net = _raw(self.mu)
         cs, co, ci, cn = net._coef(sigma)
         tok, cond = net.net.trunk(ci.reshape(-1, 1, 1, 1) * x, cn, y)

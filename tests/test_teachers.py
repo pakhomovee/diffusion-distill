@@ -1,0 +1,276 @@
+"""Invariants for the cheap tier: the interpolant family and the teacher zoo.
+
+Same rule as the other test files -- each test guards a specific way a wrong
+number could look plausible all the way into a plot. Four preconditioning
+families now share one trainer, and a mismatch between any of them and its
+checkpoint produces no exception (LOG.log ENTRY 012, FINDING 19). These are the
+checks that would notice.
+
+Deliberately tiny: this box has ~1 GB of usable RAM, so nothing here builds a
+real backbone.
+
+  python3 tests/test_teachers.py
+"""
+import json, math, os, sys, tempfile
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import numpy as np
+import torch
+
+torch.set_num_threads(1)
+FAIL = []
+
+
+def check(name, cond, detail=""):
+    print(f"  {'PASS' if cond else 'FAIL'}  {name}" + (f"   [{detail}]" if detail else ""))
+    if not cond:
+        FAIL.append(name)
+
+
+# --------------------------------------------------------------------------
+def t_interpolant_map():
+    """sigma <-> t for the linear path must match REPA's OWN formula.
+
+    REPA/loss.py's lognormal weighting computes `time_input = sigma / (1 + sigma)`
+    for path_type='linear'. That is the map this whole family rests on, so it is
+    checked against their expression rather than against my derivation of it."""
+    from ddgpu.interpolant import LinearInterpolant
+    p = LinearInterpolant()
+    sig = torch.tensor([0.01, 0.1, 1.0, 10.0, 100.0])
+    t_repa = sig / (1 + sig)                       # REPA/loss.py, verbatim
+    err = (p.t_of_sigma(sig) - t_repa).abs().max().item()
+    check("t(sigma) == REPA's sigma/(1+sigma)", err < 1e-6, f"max|err| {err:.2e}")
+    back = p.sigma_of_t(p.t_of_sigma(sig))
+    rel = ((back - sig).abs() / sig).max().item()
+    check("sigma -> t -> sigma round trip", rel < 1e-4, f"max rel {rel:.2e}")
+
+
+def t_interpolant_exact_on_gaussian():
+    """With an ORACLE velocity field, InterpolantPrecond.score must equal the
+    analytic score of a Gaussian target.
+
+    Exercises c_in, t_of_sigma and the v -> score conversion together. Getting
+    the sign of v wrong, or confusing t with 1-t, fails here and nowhere else --
+    in training it would look like a teacher that simply does not help.
+    """
+    from ddgpu.interpolant import InterpolantPrecond, LinearInterpolant
+    sd, path = 0.7, LinearInterpolant()
+
+    class OracleV(torch.nn.Module):
+        """E[eps - x0 | x_t] for x0 ~ N(0, sd^2 I).
+
+        x_t = (1-t)x0 + t*eps is Gaussian with variance (1-t)^2 sd^2 + t^2, and
+        both posteriors are linear in x_t, so the velocity is available in
+        closed form."""
+        def forward(self, u, t, y=None, **kw):
+            t = t.reshape(-1, 1, 1, 1).to(u.dtype)
+            var = (1 - t) ** 2 * sd ** 2 + t ** 2
+            e_x0 = (1 - t) * sd ** 2 / var * u        # u IS x_t here (c_in applied)
+            e_eps = t / var * u
+            return e_eps - e_x0
+
+    m = InterpolantPrecond(OracleV(), path, out_ch=4, tuple_out=False)
+    x = torch.randn(16, 4, 4, 4)
+    for s in (0.02, 0.3, 1.0, 7.0, 50.0):
+        sig = torch.full((16,), s)
+        got = m.score(x, sig, None)
+        want = -x / (sd ** 2 + s ** 2)
+        rel = ((got - want).norm() / want.norm()).item()
+        check(f"interpolant score == analytic (sigma={s})", rel < 1e-4, f"rel {rel:.2e}")
+
+    # The two limits that catch sign errors, asserted rather than reasoned about.
+    tiny = torch.full((16,), 1e-3)
+    check("D -> x as sigma -> 0",
+          ((m(x, tiny, None) - x).norm() / x.norm()).item() < 1e-3)
+    huge = torch.full((16,), 1e3)
+    xh = torch.randn(16, 4, 4, 4) * 1e3
+    check("D -> E[x0] = 0 as sigma -> inf",
+          (m(xh, huge, None).norm() / xh.norm()).item() < 1e-2)
+
+
+def t_student_grid_signature():
+    """Both schedules must accept `student_sigmas(n, sigma_max=)`; the trainer
+    and the sampler call whichever they were handed without branching."""
+    from ddgpu.vp import VPSchedule
+    from ddgpu.interpolant import LinearInterpolant
+    for name, sch, smax in (("VPSchedule", VPSchedule(), 157.4),
+                            ("LinearInterpolant", LinearInterpolant(), 49.0)):
+        g = sch.student_sigmas(4, sigma_max=smax)
+        check(f"{name}.student_sigmas(4, sigma_max=) -> 5 values", len(g) == 5)
+        check(f"{name} grid starts at ~sigma_max",
+              abs(float(g[0]) - smax) / smax < 0.02, f"{float(g[0]):.2f}")
+        check(f"{name} grid ends at 0", float(g[-1]) == 0.0)
+        check(f"{name} grid is decreasing", bool((g[:-1] > g[1:]).all()))
+
+
+# --------------------------------------------------------------------------
+def t_gaussian_teacher():
+    from ddgpu.teachers import load_teacher
+    m, meta = load_teacher("synthetic:c=4,hw=8,sd=0.5,bias=0.0")
+    check("synthetic teacher dims", meta["dims"] == 256, str(meta["dims"]))
+    x = torch.randn(8, 4, 8, 8)
+    sig = torch.full((8,), 0.9)
+    err = (m.score(x, sig) - m.true_score(x, sig)).abs().max().item()
+    check("unbiased GaussianTeacher == true score", err < 1e-6, f"{err:.2e}")
+    mb, _ = load_teacher("synthetic:c=4,hw=8,sd=0.5,bias=0.25")
+    r = (mb.score(x, sig) / mb.true_score(x, sig)).mean().item()
+    check("bias scales the score as declared", abs(r - 1.25) < 1e-5, f"{r:.4f}")
+
+
+def t_validate_teacher_catches_miswrapping():
+    """`validate_teacher` must pass a correct wrapper and FLAG a broken one.
+
+    The broken case here is the realistic one: a noise-conditioning scale that
+    is off by 1000, which is exactly the DiT-vs-SiT timestep convention hazard.
+    A teacher evaluated at the wrong noise level produces no exception, so this
+    check is the only thing standing between that bug and a week of runs.
+    """
+    from ddgpu.teachers import load_teacher, validate_teacher
+    x0 = torch.randn(64, 4, 8, 8) * 0.5
+    good, _ = load_teacher("synthetic:c=4,hw=8,sd=0.5,bias=0.0")
+    v = validate_teacher(good, x0, sigmas=(0.01, 0.1, 0.5, 2.0, 20.0))
+    check("correct wrapper -> OK", v["verdict"] == "OK", json.dumps(v)[:90])
+
+    class Miswrapped(torch.nn.Module):
+        """Same teacher, but told the wrong sigma -- the x1000 convention bug."""
+        def __init__(self, inner):
+            super().__init__(); self.inner = inner
+        def forward(self, x, sigma, y=None, **kw):
+            return self.inner(x, torch.as_tensor(sigma) * 1000.0, y, **kw)
+
+    bad = validate_teacher(Miswrapped(good), x0, sigmas=(0.01, 0.1, 0.5, 2.0, 20.0))
+    check("x1000 noise-scale bug -> SUSPECT", bad["verdict"] == "SUSPECT",
+          f"identity_err={bad['identity_err']:.3g}")
+
+
+def t_teacher_spec_errors():
+    from ddgpu.teachers import load_teacher
+    for spec, why in (("google/ddpm-cifar10-32", "no family prefix"),
+                      ("nope:whatever", "unknown family")):
+        try:
+            load_teacher(spec)
+            check(f"rejects {why}", False, "loaded anyway")
+        except ValueError:
+            check(f"rejects {why}", True)
+
+
+# --------------------------------------------------------------------------
+def t_dsm_identity():
+    """THE theoretical claim, checked on real tensors.
+
+    `E||lam*A + (1-lam)*B - g||^2 = MSE(lam) + const(sigma)` with const
+    independent of lam. If that holds, the argmin of the held-out DENOISING loss
+    (computable, no ground truth) equals the argmin of the true score MSE
+    (not computable in general). Everything `exp/10_lambda_real.py` reports as
+    falsifiable rests on it, so it is verified against a Gaussian target where
+    the true score IS available.
+    """
+    from ddgpu.teachers import load_teacher
+    from ddgpu.robust import dsm_lambda_terms, empirical_score
+    torch.manual_seed(0)
+    sd, n = 0.5, 512
+    teacher, _ = load_teacher(f"synthetic:c=4,hw=4,sd={sd},bias=0.3")
+    lam_grid = torch.linspace(0, 1, 41)
+    for s in (0.4, 1.5):
+        dsm_loss = torch.zeros(41, dtype=torch.float64)
+        true_mse = torch.zeros(41, dtype=torch.float64)
+        for _ in range(24):
+            x0 = torch.randn(2 * n, 4, 4, 4) * sd
+            y = torch.zeros(2 * n, dtype=torch.long)
+            sig = torch.full((2 * n,), s)
+            t = dsm_lambda_terms(teacher, x0, y, sig, lam_grid=lam_grid)
+            dsm_loss += t["loss"].sum(-1).double()
+            # the same A, B, evaluated against the TRUE score
+            m = n
+            eps = torch.randn_like(x0[:m])
+            xt = x0[:m] + s * eps
+            A = teacher.score(xt, sig[:m])
+            B = empirical_score(xt, x0[m:], sig[:m])
+            S = teacher.true_score(xt, sig[:m])
+            f = lambda z: z.reshape(z.shape[0], -1)
+            fA, fB, fS = f(A), f(B), f(S)
+            true_mse += torch.stack([((l * fA + (1 - l) * fB - fS) ** 2).sum(-1).sum()
+                                     for l in lam_grid]).double()
+        a1 = float(lam_grid[int(dsm_loss.argmin())])
+        a2 = float(lam_grid[int(true_mse.argmin())])
+        check(f"argmin(held-out DSM loss) == argmin(true MSE) at sigma={s}",
+              abs(a1 - a2) <= 0.051, f"dsm {a1:.3f} vs true {a2:.3f}")
+
+
+def t_offline_matches_online():
+    """The figure and the trained lambda must come from ONE implementation.
+
+    `exp/10_lambda_real.py` and `LambdaEstimator.calibrate` both call
+    `dsm_lambda_terms`. This pins that: a second, drifting copy would let us
+    publish a curve that does not describe the run it is attached to.
+    """
+    from ddgpu.teachers import load_teacher
+    from ddgpu.robust import dsm_lambda_terms, LambdaEstimator
+    teacher, _ = load_teacher("synthetic:c=4,hw=4,sd=0.5,bias=0.2")
+    x0 = torch.randn(256, 4, 4, 4) * 0.5
+    y = torch.zeros(256, dtype=torch.long)
+    sig = torch.full((256,), 1.0)
+    torch.manual_seed(7)
+    t = dsm_lambda_terms(teacher, x0, y, sig)
+    lam_direct = float(t["num"].sum() / t["den"].sum())
+    est = LambdaEstimator(n_bins=8, ema=0.0, min_count=0)
+    torch.manual_seed(7)
+    est.calibrate(teacher, x0, y, sig)
+    lam_est = float(est.lam(torch.tensor([1.0]))[0])
+    check("offline lambda == LambdaEstimator.calibrate",
+          abs(lam_direct - lam_est) < 1e-4, f"{lam_direct:.6f} vs {lam_est:.6f}")
+
+
+# --------------------------------------------------------------------------
+def t_pixel_dataset():
+    from ddgpu.data import PixelDataset, build_dataset
+    with tempfile.TemporaryDirectory() as td:
+        n, hw = 32, 8
+        px = np.random.randint(0, 256, (n, 3, hw, hw), dtype=np.uint8)
+        np.save(f"{td}/train_pixels.npy", px)
+        np.save(f"{td}/train_labels.npy", np.arange(n, dtype=np.int32) % 10)
+        json.dump(dict(n=n, resolution=hw, shape=[3, hw, hw], n_classes=10,
+                       sigma_data=0.5, space="pixel", format="pixels",
+                       latent_scale=1.0), open(f"{td}/meta.json", "w"))
+        ds = PixelDataset(td)
+        x, y = ds[5]
+        check("pixels: shape", tuple(x.shape) == (3, hw, hw))
+        check("pixels: served in [-1,1]", float(x.min()) >= -1.0 and float(x.max()) <= 1.0)
+        exact = torch.from_numpy(px[5].astype(np.float32)) / 127.5 - 1.0
+        check("pixels: lossless round trip", torch.equal(x, exact))
+        _, res = build_dataset(dict(data=td, shape=[3, hw, hw], n_classes=10))
+        check("build_dataset dispatches to pixels",
+              res["space"] == "pixel" and res["sigma_data"] == 0.5, str(res))
+
+
+def t_gaussian_data():
+    from ddgpu.data import build_dataset
+    ds, res = build_dataset(dict(data="gaussian:c=4,hw=4,sd=0.5,n=1024"))
+    x = torch.stack([ds[i][0] for i in range(1024)])
+    check("gaussian data has the declared sd", abs(float(x.std()) - 0.5) < 0.02,
+          f"{float(x.std()):.4f}")
+    check("gaussian meta carries sigma_data", res["sigma_data"] == 0.5)
+
+
+def t_conv_gan_head():
+    """The cheap tier's discriminator must accept the shapes it will be given."""
+    from ddgpu.gan import ConvGANHead, d_loss, g_loss
+    h = ConvGANHead(3)
+    x = torch.randn(4, 3, 32, 32)
+    s = torch.rand(4) * 2 + 0.1
+    out = h(x, s)
+    check("ConvGANHead -> (B,) logit", tuple(out.shape) == (4,), str(tuple(out.shape)))
+    check("hinge/NS losses are finite",
+          torch.isfinite(d_loss(out, out)) and torch.isfinite(g_loss(out)))
+
+
+# --------------------------------------------------------------------------
+if __name__ == "__main__":
+    for fn in (t_interpolant_map, t_interpolant_exact_on_gaussian,
+               t_student_grid_signature, t_gaussian_teacher,
+               t_validate_teacher_catches_miswrapping, t_teacher_spec_errors,
+               t_dsm_identity, t_offline_matches_online,
+               t_pixel_dataset, t_gaussian_data, t_conv_gan_head):
+        print(f"\n== {fn.__name__} ==")
+        fn()
+    print("\n" + ("ALL PASS" if not FAIL else f"{len(FAIL)} FAILED: {FAIL}"))
+    sys.exit(1 if FAIL else 0)

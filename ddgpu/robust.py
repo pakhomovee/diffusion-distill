@@ -43,6 +43,50 @@ def empirical_score(x, x0, sigma, chunk=256):
     return out.reshape_as(x)
 
 
+@torch.no_grad()
+def dsm_lambda_terms(teacher, real_x, real_y, sigma, cfg=1.0, lam_grid=None):
+    """The DSM calibration statistic, in one place.
+
+    Called by BOTH `LambdaEstimator.calibrate` (online, during training) and
+    `exp/10_lambda_real.py` (offline, to make the figure). One implementation,
+    so the plotted lambda and the trained lambda cannot drift apart -- which
+    would be an easy and completely invisible way to publish a curve that does
+    not describe the run it is attached to.
+
+    Returns per-sample `num`, `den` (so `lambda = sum(num)/sum(den)`), the
+    sigmas, and -- when `lam_grid` is given -- the held-out denoising loss
+    `E||lam*A + (1-lam)*B - g||^2` at each lambda on the grid. That loss is the
+    quantity the method actually minimises, and it needs no ground truth, so a
+    lambda estimated on one split and evaluated on another is a FALSIFIABLE
+    claim rather than a plot.
+
+    `real_x` is SPLIT in half: the first half supplies calibration points, the
+    second supplies the empirical score. They must be disjoint or B has seen the
+    very sample it is being scored against.
+    """
+    m = real_x.shape[0] // 2
+    if m < 2:
+        return None
+    C, D = real_x[:m], real_x[m:]
+    yC = real_y[:m]
+    sig = sigma[:m] if sigma.numel() >= m else sigma[:1].expand(m)
+    eps = torch.randn_like(C)
+    v = sig.reshape(-1, 1, 1, 1)
+    xt = C + v * eps
+    g = -eps / v
+    A = teacher.cfg_score(xt, sig, yC, scale=cfg)
+    B = empirical_score(xt, D, sig)
+    f = lambda t: t.reshape(t.shape[0], -1)
+    fA, fB, fg = f(A), f(B), f(g)
+    dAB = fA - fB
+    out = dict(num=(dAB * (fg - fB)).sum(-1), den=(dAB * dAB).sum(-1), sigma=sig)
+    if lam_grid is not None:
+        out["loss"] = torch.stack([((l * fA + (1 - l) * fB - fg) ** 2).sum(-1)
+                                   for l in lam_grid])          # (n_lam, m)
+        out["lam_grid"] = lam_grid
+    return out
+
+
 class LambdaEstimator:
     """Online estimate of lambda*(sigma), bucketed in log-sigma with EMA.
 
@@ -103,21 +147,10 @@ class LambdaEstimator:
         supplies the empirical score. They must be disjoint or B has seen the
         very sample it is being scored against, and memorises it.
         """
-        m = real_x.shape[0] // 2
-        if m < 2:
+        t = dsm_lambda_terms(teacher, real_x, real_y, sigma, cfg=cfg)
+        if t is None:
             return
-        C, D = real_x[:m], real_x[m:]
-        yC = real_y[:m]
-        sig = sigma[:m] if sigma.numel() >= m else sigma[:1].expand(m)
-        eps = torch.randn_like(C)
-        xt = C + sig.reshape(-1, 1, 1, 1) * eps
-        g = -eps / sig.reshape(-1, 1, 1, 1)
-        A = teacher.cfg_score(xt, sig, yC, scale=cfg)
-        B = empirical_score(xt, D, sig)
-        f = lambda t: t.reshape(t.shape[0], -1)
-        dAB = f(A) - f(B)
-        num = (dAB * (f(g) - f(B))).sum(-1)
-        den = (dAB * dAB).sum(-1)
+        num, den, sig = t["num"], t["den"], t["sigma"]
         b = self.bucket(sig)
         self.dsm_num.mul_(self.ema).index_add_(0, b, num.float() * (1 - self.ema))
         self.dsm_den.mul_(self.ema).index_add_(0, b, den.float() * (1 - self.ema))

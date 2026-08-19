@@ -1,9 +1,11 @@
 """One-off dataset preparation: VAE latents and the FID reference statistics.
 
-Two subcommands, both sharded across GPUs and both resumable:
+Three subcommands, all sharded across GPUs and all resumable:
 
     python -m ddgpu.prepare latents  --source /data/imagenet/train --dest /data/in256 \
                                      --resolution 256 --gpus 0,1,2,3
+    python -m ddgpu.prepare pixels   --source cifar10 --dest /data/cifar10 \
+                                     --resolution 32
     python -m ddgpu.prepare refstats --source /data/imagenet/train --dest /data/in256 \
                                      --resolution 256 --gpus 0,1,2,3 --n 50000
 
@@ -86,6 +88,42 @@ class ImageFolderFlat(torch.utils.data.Dataset):
         return x, y
 
 
+class TorchvisionImages(torch.utils.data.Dataset):
+    """A torchvision classification set, presented like `ImageFolderFlat`.
+
+    Only used for the small standard benchmarks (CIFAR-10) where downloading
+    through torchvision is far less friction than staging an image folder.
+    Images come out in [-1, 1], the same convention as `ImageFolderFlat`.
+    """
+    SETS = {"cifar10": ("CIFAR10", 10), "cifar100": ("CIFAR100", 100)}
+
+    def __init__(self, name, resolution, root="~/.cache/dd-data", train=True):
+        import torchvision
+        cls, ncls = self.SETS[name]
+        self.ds = getattr(torchvision.datasets, cls)(
+            os.path.expanduser(root), train=train, download=True)
+        self.res, self.n_classes = resolution, ncls
+        self.classes = [str(i) for i in range(ncls)]
+        self.samples = [(None, int(y)) for _, y in self.ds]
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, i):
+        img, y = self.ds[i]
+        if img.size != (self.res, self.res):
+            img = img.resize((self.res, self.res), resample=Image.BICUBIC)
+        x = torch.from_numpy(np.array(img.convert("RGB"))).permute(2, 0, 1)
+        return x.float() / 127.5 - 1.0, y
+
+
+def image_source(source, resolution):
+    """`--source cifar10` -> torchvision; anything else -> an image folder."""
+    if source in TorchvisionImages.SETS:
+        return TorchvisionImages(source, resolution)
+    return ImageFolderFlat(source, resolution)
+
+
 # ---------------------------------------------------------------------------
 # Sharding
 # ---------------------------------------------------------------------------
@@ -136,7 +174,7 @@ LATENT_SCALE = 0.18215          # SD-VAE; the value DiT and LDM train with
 
 def cmd_latents(a):
     rank, world = _shard_id()
-    ds = ImageFolderFlat(a.source, a.resolution)
+    ds = image_source(a.source, a.resolution)
     n, lat_hw, dest = len(ds), a.resolution // 8, a.dest
     os.makedirs(dest, exist_ok=True)
     mom_path = f"{dest}/{a.split}_moments.npy"
@@ -212,6 +250,73 @@ def _wait_for(path, timeout=1800):
 
 
 # ---------------------------------------------------------------------------
+# pixels  (the cheap tier: CIFAR-10, ImageNet-64 -- no VAE anywhere)
+# ---------------------------------------------------------------------------
+def cmd_pixels(a):
+    """Write a uint8 (N, 3, H, W) memmap plus labels and a measured sigma_data.
+
+    Pixel space is not a downgrade of the latent path, it is a different point
+    on the same axis: CIFAR-10 at 32px is 3072 dims against 4096 for a 256px
+    SD-VAE latent, and ImageNet-64 at 12288 dims is THREE TIMES the dimension of
+    that latent. The VAE exists to make high-RESOLUTION cheap; it does not make
+    the working dimension small. See FINDINGS.md 6.
+
+    Stored as uint8 because that is lossless for images and a quarter the size
+    of fp16; the [-1,1] conversion happens in `PixelDataset`.
+    """
+    rank, world = _shard_id()
+    ds = image_source(a.source, a.resolution)
+    n, dest = len(ds), a.dest
+    os.makedirs(dest, exist_ok=True)
+    px_path, lab_path = f"{dest}/{a.split}_pixels.npy", f"{dest}/{a.split}_labels.npy"
+    meta_path = f"{dest}/meta.json"
+    if os.path.exists(meta_path) and not a.refresh:
+        print(f"[pixels] {meta_path} exists; nothing to do (use --refresh)")
+        return
+
+    ready = f"{dest}/.alloc_done"
+    if rank == 0:
+        if not os.path.exists(px_path):
+            np.lib.format.open_memmap(px_path, "w+", np.uint8,
+                                      (n, 3, a.resolution, a.resolution)).flush()
+        np.save(lab_path, np.array([y for _, y in ds.samples], np.int32))
+        open(ready, "w").write(str(n))
+    if world > 1:
+        _wait_for(ready)
+
+    lo, hi = shard_bounds(n, world, rank)
+    dl = torch.utils.data.DataLoader(torch.utils.data.Subset(ds, range(lo, hi)),
+                                     a.batch_size, num_workers=a.num_workers,
+                                     shuffle=False)
+    px = np.lib.format.open_memmap(px_path, "r+")
+    i, sq, cnt = lo, 0.0, 0
+    for bi, (x, _) in enumerate(dl):
+        px[i:i + len(x)] = ((x + 1) * 127.5).clamp(0, 255).to(torch.uint8).numpy()
+        sq += float(x.double().pow(2).sum()); cnt += x.numel()
+        i += len(x)
+        if bi % 100 == 0:
+            print(f"[pixels r{rank}] {i - lo}/{hi - lo}", flush=True)
+    px.flush()
+    np.save(f"{dest}/.stat_{rank}.npy", np.array([sq, cnt], np.float64))
+
+    if rank == 0:
+        for r in range(world):
+            _wait_for(f"{dest}/.stat_{r}.npy")
+        tot = sum(np.load(f"{dest}/.stat_{r}.npy") for r in range(world))
+        sigma_data = float(np.sqrt(tot[0] / tot[1]))
+        json.dump(dict(n=n, resolution=a.resolution, shape=[3, a.resolution, a.resolution],
+                       dims=3 * a.resolution ** 2, sigma_data=round(sigma_data, 4),
+                       n_classes=len(ds.classes), space="pixel", format="pixels",
+                       latent_scale=1.0),
+                  open(meta_path, "w"), indent=1)
+        for r in range(world):
+            os.remove(f"{dest}/.stat_{r}.npy")
+        os.remove(ready)
+        print(f"[pixels] done: n={n} dims={3 * a.resolution ** 2} "
+              f"sigma_data={sigma_data:.4f} -> {meta_path}")
+
+
+# ---------------------------------------------------------------------------
 # refstats
 # ---------------------------------------------------------------------------
 def build_inception(device):
@@ -233,7 +338,7 @@ def inception_feats(model, images_uint8, device, batch=64):
 
 def cmd_refstats(a):
     rank, world = _shard_id()
-    ds = ImageFolderFlat(a.source, a.resolution)
+    ds = image_source(a.source, a.resolution)
     n = min(a.n, len(ds)) if a.n else len(ds)
     os.makedirs(a.dest, exist_ok=True)
     out = f"{a.dest}/ref_{a.resolution}_{n}.npz"
@@ -274,9 +379,10 @@ def cmd_refstats(a):
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("latents", "refstats"):
+    for name in ("latents", "pixels", "refstats"):
         q = sub.add_parser(name)
-        q.add_argument("--source", required=True, help="image root (class subdirs)")
+        q.add_argument("--source", required=True,
+                       help="image root (class subdirs), or 'cifar10'/'cifar100'")
         q.add_argument("--dest", required=True)
         q.add_argument("--resolution", type=int, default=256)
         q.add_argument("--batch-size", type=int, default=64)
@@ -285,6 +391,8 @@ def main():
         q.add_argument("--refresh", action="store_true")
         if name == "latents":
             q.add_argument("--vae", default="stabilityai/sd-vae-ft-mse")
+            q.add_argument("--split", default="train")
+        elif name == "pixels":
             q.add_argument("--split", default="train")
         else:
             q.add_argument("--n", type=int, default=50000)
@@ -296,7 +404,7 @@ def main():
         if len(gpus) > 1:
             return _spawn_shards(_strip_gpus(sys.argv[1:]), gpus)
         os.environ["CUDA_VISIBLE_DEVICES"] = gpus[0]
-    (cmd_latents if a.cmd == "latents" else cmd_refstats)(a)
+    {"latents": cmd_latents, "pixels": cmd_pixels, "refstats": cmd_refstats}[a.cmd](a)
 
 
 if __name__ == "__main__":

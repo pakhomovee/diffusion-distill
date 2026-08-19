@@ -1,5 +1,10 @@
 # Running the experiments on a GPU box
 
+> **Running this for the first time? Skip to [the cheap tier](#the-cheap-tier-start-here).**
+> That is the ~230–455 GPU-hour plan (FINDINGS.md §6) and it is what to run now.
+> Everything before it is the ~5,000 GPU-hour ImageNet-256/512 programme, kept
+> intact for when the cheap tier justifies spending it.
+
 One entry point — [`train.sh`](train.sh) — sets up the environment, fetches the
 teacher, optionally builds the dataset, and launches `ddgpu.train` under
 `torchrun`. The layout mirrors `repa-surgery/training/`, so a box configured for
@@ -211,3 +216,132 @@ volume instead:
 ```bash
 export DD_DATA_ROOT=/root/autodl-tmp/data DD_CKPT_ROOT=/root/autodl-tmp/ckpt
 ```
+
+---
+
+# The cheap tier (start here)
+
+`FINDINGS.md` §6 replaces the ~5,000 GPU-hour ImageNet-256/512 programme with a
+~230–455 GPU-hour one that keeps the dimension ladder. Everything above still
+works and is what you run *if* the cheap tier says the effect is real.
+
+Three datasets, three preconditioning families, one launcher:
+
+| env | space | dims | teacher | why |
+|---|---|---:|---|---|
+| `cifar10` | pixel | 3,072 | `diffusers:google/ddpm-cifar10-32` (≈36 M) | cheapest arm that can move FID |
+| `imagenet64` | pixel | 12,288 | `edm:edm-imagenet-64x64-cond-adm.pkl` (≈296 M) | the rung that makes the ladder credible |
+| `in100_latent` | **latent** | 4,096 | `sit:...0300000.pt` (≈130 M, self-trained) | latent space + a weaker-teacher capacity probe |
+
+Note the dimensions before reading this as a retreat: **ImageNet-64 in pixel
+space is 3× higher-dimensional than ImageNet-256 in latent space** (12,288 vs
+4,096), and CIFAR-10 is 75% of it. The VAE makes high *resolution* cheap, not
+high *dimension* small.
+
+## Phase A — the λ ladder (inference only, ~10–15 GPU-h)
+
+No student, no critic, no optimiser. This is the paper's Figure 1 and the
+cheapest high-information experiment in the programme.
+
+```bash
+# self-test first: a target whose true score is known, so the script proves
+# itself before it is pointed at a model whose answer nobody knows
+python3 exp/10_lambda_real.py --teacher "synthetic:c=4,hw=8,sd=0.5,bias=0.15" \
+    --data "gaussian:c=4,hw=8,sd=0.5,n=4096" --batch 128 --batches 3 \
+    --n-sigma 5 --sigma-min 0.05 --sigma-max 8 --tag selftest
+
+# then the ladder
+python3 exp/10_lambda_real.py --teacher diffusers:google/ddpm-cifar10-32 \
+    --data data/cifar10 --tag cifar10_3072
+python3 exp/10_lambda_real.py --teacher edm:$DD_CKPT_ROOT/edm-imagenet-64x64-cond-adm.pkl \
+    --data data/in64 --tag in64_12288
+python3 exp/10_lambda_real.py --teacher dit:$DD_CKPT_ROOT/DiT-XL-2-512x512.pt \
+    --data data/in512 --tag dit512_16384        # 16,384 dims, never trained there
+python3 exp/10_lambda_real.py --teacher sit:$SIT_CKPT --data data/in100_256 \
+    --tag sit_latent_4096
+```
+
+Read the output in this order:
+
+1. **`gain_vs_teacher`** — held-out denoising loss at λ̂ divided by the loss at
+   λ=1 (plain DMD2). Below 1.0 means the fusion reduces *true* score MSE; the
+   identity `E‖λA+(1−λ)B−g‖² = MSE(λ)+const` makes that exact with no ground
+   truth. λ̂ is estimated on one split and tested on a fresh one, so it is not
+   circular. **If this is not below 1.0, the method does not work at that
+   dimension** — a real negative result for a few GPU-hours.
+2. **λ_dsm(σ)** — FINDINGS §1.1's shape on a real image model.
+3. **The off-manifold panel** — ratio statistic at blurred/shifted/collapsed real
+   data. A *lower bound* on λ*: compare its legs, never the levels, and never
+   against panel 2.
+
+Phase A **cannot** produce the drift result (§1.2/§3.1): calibration evaluates at
+noised *real* data, and the DSM identity does not extend to student samples.
+That needs a training run, which logs it via `probe_every`.
+
+## Phases C/D/E — the distillation pairs
+
+```bash
+# C: CIFAR-10, 3 seeds per arm. One GPU; micro 512 clears the batch floors.
+scripts/train.sh -d cifar10 --mode dmd2   --gpus 0 --micro-batch 512 --seed 0
+scripts/train.sh -d cifar10 --mode robust --gpus 0 --micro-batch 512 --seed 0
+#  ... repeat with --seed 1 and --seed 2
+
+# D: ImageNet-64 (required, not optional -- it is the ladder's high rung)
+export EDM_REPO=/root/autodl-tmp/edm      # git clone https://github.com/NVlabs/edm
+scripts/train.sh -d imagenet64 --mode dmd2   --gpus 0,1,2,3 --prepare
+scripts/train.sh -d imagenet64 --mode robust --gpus 0,1,2,3
+
+# E: the latent leg, with your own SiT teacher
+export REPA_DIR=/root/autodl-tmp/repa-surgery/REPA
+export SIT_CKPT=$DD_CKPT_ROOT/imagenet100_sit-b_2_baseline/checkpoints/0300000.pt
+scripts/train.sh -d in100_latent --mode dmd2   --gpus 0,1,2,3
+scripts/train.sh -d in100_latent --mode robust --gpus 0,1,2,3
+```
+
+**Three seeds is not optional at CIFAR scale.** One-step CIFAR-10 distillation is
+near-saturated, so the effect may be smaller than run-to-run variance and one run
+per arm cannot tell the difference. `eval_all.sh` prints the seed-grouped table
+with an explicit standard-error verdict:
+
+```
+best=cifar10_dmd2 (3.200) vs cifar10_robust (3.217); gap 0.017, se 0.105 -> 0.2 se
+VERDICT: the gap is INSIDE one standard error. Report this as no measured
+         difference, not as a win.
+```
+
+## Getting the teachers
+
+```bash
+# CIFAR-10: nothing to do, diffusers fetches and caches on first use.
+
+# ImageNet-64 (EDM). The pickle needs NVlabs' source importable.
+git clone https://github.com/NVlabs/edm /root/autodl-tmp/edm && export EDM_REPO=/root/autodl-tmp/edm
+wget https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl \
+     -O $DD_CKPT_ROOT/edm-imagenet-64x64-cond-adm.pkl
+
+# ImageNet-100 latent leg: the SiT checkpoint + images from HuggingFace.
+# >130 GB -- fetch_hf.py REFUSES to start with less than 200 GB free, because a
+# partial snapshot_download looks exactly like a complete one.
+python3 scripts/fetch_hf.py --repo pakhomovee/imagenet --repo-type dataset \
+    --dest $DD_DATA_ROOT/in100_raw --dry-run     # check space first
+```
+
+## Verify every teacher before trusting a number
+
+Four preconditioning families now share one trainer, and a mismatch between any
+of them and its checkpoint produces **no exception** — LOG.log ENTRY 012 is the
+story of exactly that. So check, and record the numbers:
+
+```bash
+python3 -m ddgpu.teachers --teacher diffusers:google/ddpm-cifar10-32 --data data/cifar10
+```
+
+```
+{"rel_mse@0.01": 0.0004, ..., "identity_err": 1.6e-11, "monotone": true, "verdict": "OK"}
+```
+
+`rel_mse` should be ~0 at small σ and rise toward 1 at large σ. A teacher wrapped
+with the wrong noise convention shows it **flat and near 1 everywhere**, because
+the network is being evaluated at a noise level unrelated to the one applied.
+`ddgpu.train` runs this before every run and refuses to start on `SUSPECT`
+(override with `--set strict_teacher=false`, deliberately).

@@ -856,3 +856,243 @@ no reason to hold. The first thing to run on the VM is `scripts/smoke.sh --gpu`
 followed by the teacher fetch, which verifies the positional grid against the
 real file -- that is the moment FINDING 20's guard either passes or earns its
 keep.
+
+
+================================================================================
+ENTRY 013 -- THE CHEAP TIER: SAME DIMENSION LADDER, 1/19 THE PARAMETERS
+================================================================================
+
+ENTRY 012 left a programme costing ~3,100 GPU-hours core and ~5,000 with
+ablations and contingency (26 days on an 8x5090 node). That is more than the
+project has. This entry rebuilds the experimental plan at ~200-375 GPU-h without
+giving up the axis the method is actually at risk on.
+
+--------------------------------------------------------------------------------
+FINDING 23 -- what has to shrink is PARAMETERS, not dimension, and those are
+separable
+
+info.txt said it first: "your risk is dimension, your budget constraint is
+parameters -- and you can separate them." The expensive plan separated them only
+partially (DiT-XL/2 at two resolutions). The cheap tier separates them fully.
+
+  tier      setup                          dims     teacher params
+  --------  -----------------------------  ------   --------------
+  expensive DiT-XL/2 @256px latent           4096      674.82 M
+  expensive DiT-XL/2 @512px latent          16384      674.82 M
+  cheap     CIFAR-10 @32px PIXEL             3072      ~36 M
+  cheap     ImageNet-64 @64px PIXEL         12288      ~296 M
+  cheap     ImageNet-100 @256px latent       4096      ~130 M  (self-trained SiT)
+
+The ladder ratio is preserved exactly: 4096 -> 16384 becomes 3072 -> 12288, both
+4x, only 25% lower in absolute terms. Parameters drop 19x at the low rung.
+
+The point that makes this work, and that is easy to get backwards:
+
+  IMAGENET-64 IN PIXEL SPACE IS 3x HIGHER-DIMENSIONAL THAN IMAGENET-256 IN
+  LATENT SPACE.  12288 vs 4096.
+
+The VAE exists to make high RESOLUTION cheap. It does not make the working
+dimension small -- it makes it smaller than the pixel count, which is a different
+claim. "We dropped from 256px to 64px" sounds like a 16x reduction and is in fact
+a 3x INCREASE in the quantity FINDINGS.md 1.3 says the method breaks on. Anyone
+reading the plan as a retreat has confused resolution with dimension.
+
+Note also DiT-XL/2 is 674.82 M parameters at BOTH 256px and 512px -- identical
+count, 4x the tokens. Capacity in diffusion tracks distribution complexity and
+noise-level coverage, not pixel count. That is why CIFAR-10 saturates at ~36 M
+while ImageNet-64, on a smaller grid, needs ~296 M.
+
+--------------------------------------------------------------------------------
+FINDING 24 -- the headline figure needs no training at all, but it cannot
+produce the mechanism result, and I nearly claimed it could
+
+lambda_dsm(sigma) = E<A-B, g-B> / E||A-B||^2 needs a pretrained teacher, real
+data, and forward passes. No student, no critic, no optimiser. So the whole
+dimension ladder from 3072 to 16384 dims is an INFERENCE job of a few GPU-hours
+(exp/10_lambda_real.py), including the DiT-XL/2 @512 leg -- we can measure at
+16384 dims without ever training there, and on a 50k-image subset rather than
+the 84 GB full prep.
+
+But `LambdaEstimator.calibrate` evaluates at `xt = C + sigma*eps` where C is
+REAL data (robust.py). It is an ON-DISTRIBUTION measurement. FINDINGS.md 1.2's
+mechanism claim -- the real-data term corrects the teacher OFF the manifold --
+and 3.1's drift prediction both live at STUDENT samples, and the DSM identity
+does not extend there: `g = -eps/sigma` is unbiased for the score of whatever
+distribution x0 came from, so perturbing x0 measures lambda for the perturbed
+distribution, not the real one.
+
+So Phase A falsifies the folklore (1.1) at real scale and CANNOT establish the
+replacement. The drift needs a student, i.e. a training run. exp/10_lambda_real.py
+ships an off-manifold panel using the ratio statistic instead (blur / shift /
+collapse applied to real data, mirroring exp04's rows), clearly labelled
+COMPARATIVE ONLY -- it is a lower bound on lambda*, valid for comparing its own
+two legs and nothing else.
+
+--------------------------------------------------------------------------------
+FINDING 25 -- an inference-only curve is unfalsifiable unless it is made
+falsifiable, and it can be
+
+At d=512 synthetic, exp08 could check lambda_dsm against the exact lambda*. On
+real data there is no lambda*, so a lambda(sigma) plot is a number with nothing
+to verify it against -- and 1.3 is the story of an estimator that looked fine and
+was 3.19x worse than baseline.
+
+The fix costs nothing and is now the headline output of Phase A. Estimate lambda
+on split 1; evaluate the held-out denoising loss `E||lam*A + (1-lam)*B - g||^2`
+on a FRESH split 2. Because
+
+    E||lam*A + (1-lam)*B - g||^2 = MSE(lam) + const(sigma)
+
+with const independent of lam, a reduction in that loss IS a reduction in true
+score MSE, with no ground truth anywhere. We report the loss at lambda_hat
+against lambda=1 (plain DMD2) and lambda=0 (data only). Estimating on one split
+and testing on another is what makes it non-circular -- lambda_hat is the
+closed-form argmin on split 1, so testing it there would prove nothing.
+
+If `gain_vs_teacher` is not below 1.0, the method does not work at that
+dimension. That is a real negative result for a few GPU-hours instead of a week
+of distillation.
+
+VERIFIED, on real tensors, in tests/test_teachers.py:t_dsm_identity: against a
+Gaussian target where the true score IS available, argmin of the held-out DSM
+loss equals argmin of the true score MSE at sigma=0.4 (1.000 vs 1.000) and
+sigma=1.5 (0.100 vs 0.100). The identity the entire falsifiability argument
+rests on is now checked rather than asserted.
+
+Self-test of the whole Phase A pipeline against a biased Gaussian teacher
+(bias=0.15, d=256) reproduces 1.1's shape immediately:
+
+    sigma     lam_hat   grid_argmin   gain_vs_teacher
+    0.050      1.000       1.000          1.0000
+    0.178      1.000       1.000          1.0000
+    0.632      1.000       1.000          1.0000
+    2.249      0.438       0.450          0.8426
+    8.000      0.005       0.000          0.1509
+
+Teacher-heavy at low noise, data-heavy at high noise, and lam_hat tracks the
+grid argmin to within one grid step everywhere.
+
+--------------------------------------------------------------------------------
+FINDING 26 -- three more preconditioning families, and the check that they are
+wired right
+
+ENTRY 012 found one preconditioning mismatch (VP teacher read as EDM) that
+produced no exception. The cheap tier adds three more chances to make the same
+class of mistake, so all four now go through one door -- ddgpu/teachers.py --
+and that door validates.
+
+  dit:...        VP eps, discrete t, latent    VPPrecond          (ENTRY 012)
+  diffusers:...  VP eps, discrete t, pixel     VPPrecond          NEW
+  edm:...        already D(x,sigma), pixel     EDMPklDenoiser     NEW
+  sit:...        linear-interpolant velocity   InterpolantPrecond NEW
+  synthetic:...  analytic / tiny MLP           for tests          NEW
+
+Two of these are traps worth naming:
+
+  * EDM pickles are ALREADY preconditioned denoisers. Wrapping one in EDMWrapper
+    applies the preconditioning twice and produces plausible-looking output
+    rather than an error. `EDMPklDenoiser` is a deliberate passthrough.
+  * SiT predicts a VELOCITY along a linear interpolant, and `SiT.forward` has no
+    force_drop_ids path, so classifier-free guidance must be done by substituting
+    the null class id rather than by a dropout flag. It also returns a TUPLE
+    (prediction, projector features). Both are absorbed in `SiTNetAdapter`, at
+    the adapter rather than deeper, so a model that changes either fails loudly.
+
+The interpolant change of variables (ddgpu/interpolant.py), derived and then
+CHECKED against REPA's own code:
+
+    x_t = (1-t)x0 + t*eps,  v = eps - x0,  sigma = t/(1-t),  t = sigma/(1+sigma)
+    c_in = 1/(1+sigma),  c_skip = 1/(1+sigma),  c_out = -sigma/(1+sigma)
+    score(x,sigma) = -(x + v_hat) / (sigma (1+sigma))
+
+REPA/loss.py's lognormal weighting independently computes
+`time_input = sigma / (1 + sigma)` for path_type='linear' -- the same map. That
+agreement is why this is trustworthy rather than a plausible derivation, and
+tests/test_teachers.py asserts it against their expression verbatim. It also
+confirms t is passed RAW in [0,1], not scaled by 1000 like DiT's.
+
+`validate_teacher` measures the denoising loss across sigma plus two limits:
+D(x,sigma) -> x as sigma -> 0, and -> E[x0] as sigma -> inf. A teacher wrapped
+with the wrong noise convention shows rel_mse flat near 1 everywhere, because
+the network is being evaluated at a noise level unrelated to the one applied.
+tests/test_teachers.py deliberately introduces the x1000 timestep-scale bug and
+confirms the verdict flips to SUSPECT (identity_err 0.64 against 1.6e-11 for the
+correct wrapper). ddgpu/train.py runs this before every run and refuses to start
+on SUSPECT unless strict_teacher=false.
+
+--------------------------------------------------------------------------------
+FINDING 27 -- at CIFAR scale the effect may be smaller than the seed noise, and
+one run per arm cannot tell
+
+FINDINGS.md 2 already names "6-9% mean score-MSE may not move FID" as Track A's
+biggest risk. Going smaller does not reduce it. One-step CIFAR-10 distillation is
+near-saturated (published FIDs ~2-4), so a modest estimator improvement can sit
+inside run-to-run variance, and a single run per arm cannot distinguish "no
+effect" from "effect smaller than noise".
+
+So the cheap tier runs 3 seeds per arm (`--seed N`, run dir gets `_sN`), and
+`ddgpu.eval --seeds` groups them, reports mean +/- sd, and prints an explicit
+verdict:
+
+    best=c_dmd2 (3.200) vs c_robust (3.217); gap 0.017, se 0.105 -> 0.2 se
+    VERDICT: the gap is INSIDE one standard error. Report this as no measured
+             difference, not as a win.
+
+It also refuses to call a win with fewer than 3 seeds per arm even when the gap
+exceeds one se, because the variance estimate is itself unreliable there. This
+is the single easiest way to publish a difference that is not real, and it is now
+harder to do by accident than to do correctly.
+
+--------------------------------------------------------------------------------
+SMALLER THINGS
+
+  * The cheap tier's teachers are UNets and SiTs with no exposed token trunk, so
+    DMD2's "discriminator on the critic's own features" cannot be reused.
+    `gan.ConvGANHead` is a small standalone conv net conditioned on log-sigma.
+    This DEVIATES from DMD2 and the deviation is stated: both arms use the
+    identical head and the method arm uses none at all, so the comparison stands,
+    but the cheap tier's absolute baseline FID is comparable only to OUR baseline,
+    not to DMD2's published number.
+  * With a registry teacher the student and critic are CLONES of it
+    (`train.clone_trainable`). That makes init_from_teacher exact by construction
+    for every backbone family -- no architecture config to get wrong, no state
+    dict to remap, no positional grid to verify.
+  * `dsm_lambda_terms` is now the single implementation of the DSM statistic,
+    called by both `LambdaEstimator.calibrate` (online) and
+    exp/10_lambda_real.py (offline). A second drifting copy would let us publish
+    a curve that does not describe the run it is attached to;
+    tests/test_teachers.py:t_offline_matches_online pins them to 1e-4.
+  * The launcher's batch guard had two thresholds conflated. Now separated: a
+    HARD floor of 256 on the effective real batch (FINDINGS 1.4), and a SOFT
+    warning when the calibration half-split falls below 256 (FINDINGS 5).
+  * Pixel data path added (`prepare pixels`, `data.PixelDataset`): uint8, no VAE
+    in the loop. CIFAR-10 is 0.15 GB, ImageNet-64 is 15.7 GB, against 21 GB /
+    84 GB for the 256/512px latents.
+  * `scripts/fetch_hf.py` refuses to start unless the destination has 200 GB
+    free. The ImageNet-100 repo backing the SiT teacher is >130 GB, and a
+    partial snapshot_download looks exactly like a complete one.
+
+--------------------------------------------------------------------------------
+WHAT THE CHEAP TIER BUYS, AND WHAT IT GIVES UP
+
+Buys: the lambda ladder from 3072 to 16384 dims with real network teachers
+(inference, ~10 GPU-h); a falsifiable held-out gain at each rung; distillation
+pairs at 3072 and 12288 dims with 3 seeds each; a LATENT-space leg at 4096 dims
+from a self-trained SiT-B/2 that also serves as a teacher-capacity probe, since
+it is deliberately weaker (FID ~16) than the released teachers -- FINDINGS.md 4's
+Run 3 wanted exactly that axis and it now costs nothing.
+
+Gives up: no trained latent result at ImageNet scale, and no competitive
+ImageNet-256 FID table. The trained evidence tops out at 12288 dims while the
+measured evidence reaches 16384. Both gaps are stated in FINDINGS.md 5 rather
+than hidden, and both are the honest price of a 13-25x saving.
+
+This is a de-risking plan, not a final-paper plan. It answers "is the effect real,
+and does lambda transfer to high dimension" for ~200-375 GPU-h. If yes, the
+ImageNet-256 budget is worth spending and the ENTRY 012 pipeline is still there
+to spend it with. If no, we learned it in two days instead of two weeks.
+
+STILL NOT RUN ON A GPU. Everything above is verified on CPU against analytic
+targets and tiny fixtures. The first real test is `scripts/smoke.sh --gpu`
+followed by `python3 -m ddgpu.teachers --teacher diffusers:google/ddpm-cifar10-32
+--data data/cifar10`, which is where validate_teacher meets a real checkpoint.

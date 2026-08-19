@@ -39,7 +39,21 @@ def _setup():
 
 
 def build_student(c, device, state):
-    from .train import wrap_precond
+    """Rebuild the student exactly as training built it.
+
+    Registry teachers (`c["teacher"]`) produced the student by cloning the
+    teacher, so the sampler rebuilds it the same way -- load the teacher, clone,
+    overwrite with the trained weights. Rebuilding from an arch config instead
+    would silently diverge for any backbone that is not our own DiT.
+    """
+    from .train import wrap_precond, _teacher_schedule
+    if c.get("teacher"):
+        from .teachers import load_teacher
+        kw = {k: c[k] for k in ("repa_dir", "edm_repo") if c.get(k)}
+        G, _ = load_teacher(c["teacher"], device=device,
+                            sigma_data=c["sigma_data"], **kw)
+        G.load_state_dict(state)
+        return G.eval(), _teacher_schedule(G)
     sch = VPSchedule(c.get("n_timestep", 1000)).to(device) \
         if c.get("precond", "edm") == "vp" else None
     net = make_dit(c["arch"], input_size=c["latent_size"], in_ch=c["shape"][0],
@@ -55,7 +69,7 @@ def student_sigmas(c, sch, device):
     if n <= 1:
         return None
     if sch is not None:
-        return sch.student_sigmas(n).to(device)
+        return sch.student_sigmas(n, sigma_max=c["sigma_max"]).to(device)
     return edm_sigmas(n, sigma_max=c["sigma_max"], device=device)
 
 

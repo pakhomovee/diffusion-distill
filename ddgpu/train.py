@@ -63,7 +63,31 @@ def build_model(c, device, schedule, precond=True, grad_ckpt=True):
 
 
 def load_teacher(c, device, schedule, log):
-    """Frozen teacher, plus whatever the checkpoint tells us about the config."""
+    """Frozen teacher, plus whatever the checkpoint tells us about the config.
+
+    Preferred path is `c["teacher"] = "<family>:<path>"`, which goes through
+    `ddgpu.teachers` and covers all four preconditioning families. The legacy
+    `teacher_ckpt` + `teacher_format` path is kept for the DiT configs written
+    before the registry existed.
+    """
+    if c.get("teacher"):
+        from .teachers import load_teacher as _load
+        kw = {k: c[k] for k in ("repa_dir", "edm_repo", "weights") if c.get(k)}
+        m, meta = _load(c["teacher"], device=device, sigma_data=c["sigma_data"], **kw)
+        log("teacher: " + json.dumps(meta, default=str))
+        res = dict(shape=meta["shape"], n_classes=meta["n_classes"],
+                   teacher_family=meta["family"], space=meta["space"],
+                   teacher_sigma_max=meta["sigma_max"],
+                   teacher_sigma_min=meta["sigma_min"],
+                   latent_size=meta["shape"][-1])
+        # A teacher that cannot do classifier-free guidance must not be asked
+        # to: silently ignoring cfg_scale would make an unconditional model look
+        # like a guided one in the logs.
+        if not meta.get("cfg_capable", True) and c.get("cfg_scale", 1.0) != 1.0:
+            raise ValueError(
+                f"{c['teacher']} is unconditional but cfg_scale={c['cfg_scale']}. "
+                "Set cfg_scale=1.0.")
+        return m.eval(), res
     resolved = {}
     path = c.get("teacher_ckpt")
     if path and c.get("teacher_format", "official") == "official":
@@ -95,6 +119,25 @@ def wrap_ddp(m, rank, world, static_graph=False):
         m, device_ids=[rank % torch.cuda.device_count()],
         find_unused_parameters=False, gradient_as_bucket_view=True,
         broadcast_buffers=False, static_graph=static_graph)
+
+
+def _teacher_schedule(teacher):
+    """The noise schedule a registry teacher was trained on, if it has one.
+
+    VPPrecond carries a `VPSchedule`, InterpolantPrecond a `LinearInterpolant`;
+    both expose `sigma_of_t` / `student_sigmas` / `sigma_max`. EDM checkpoints
+    carry none -- their sigma is already the free variable -- so they fall back
+    to the EDM lognormal and an EDM rho=7 sampler grid.
+    """
+    return getattr(teacher, "sch", None) or getattr(teacher, "path", None)
+
+
+def clone_trainable(teacher):
+    """A trainable copy of the frozen teacher, same class and same weights."""
+    m = copy.deepcopy(teacher).train()
+    for p in m.parameters():
+        p.requires_grad_(True)
+    return m
 
 
 class EMA:
@@ -156,13 +199,42 @@ def main():
     for p in teacher.parameters():
         p.requires_grad_(False)
 
+    # Optional but strongly recommended: prove the teacher is wrapped correctly
+    # before spending a run on it. LOG.log ENTRY 012 FINDING 19 is what happens
+    # when a preconditioning mismatch goes unchecked -- no exception, just a
+    # teacher that returns noise.
+    if c.get("validate_teacher", True) and rank == 0:
+        from .teachers import validate_teacher
+        xb = torch.stack([ds[i][0] for i in range(min(64, len(ds)))]).to(dev)
+        yb = torch.tensor([ds[i][1] for i in range(min(64, len(ds)))]).to(dev)
+        v = validate_teacher(teacher, xb, yb, device=dev)
+        log("TEACHER-CHECK " + json.dumps(v))
+        if v["verdict"] != "OK" and c.get("strict_teacher", True):
+            raise SystemExit(
+                "teacher validation SUSPECT -- the denoising loss does not behave "
+                "like a correctly-wrapped denoiser (see ddgpu/teachers.py:"
+                "validate_teacher for how to read these). Set strict_teacher=false "
+                "to override deliberately.")
+
     # The student generates from sigma_max. For a VP teacher that is the top of
     # its own schedule (157.4 for linear-1000), NOT EDM's 80: starting a
     # one-step student half way up a schedule it was initialised from is a
     # silent quality loss with no error message.
+    # A registry teacher carries its own noise schedule; use it for both the
+    # sampler grid and the training noise distribution rather than a config
+    # constant. `sigma_max` is where a one-step student starts, so getting it
+    # from anywhere other than the teacher is guesswork.
+    sch = _teacher_schedule(teacher) or schedule
     if c.get("sigma_max") in (None, "schedule"):
-        c["sigma_max"] = schedule.sigma_max if schedule else 80.0
-        log(f"sigma_max resolved from schedule: {c['sigma_max']:.3f}")
+        c["sigma_max"] = c.get("teacher_sigma_max") or (
+            sch.sigma_max if sch else 80.0)
+        # An interpolant teacher's nominal sigma_max is 1e4 (t -> 1), which no
+        # sampler should start from; cap it at the trimmed training window.
+        if c.get("teacher_family") == "interpolant":
+            hi = float(c.get("t_hi", 0.98))
+            c["sigma_max"] = hi / (1.0 - hi)
+        log(f"sigma_max resolved from the teacher: {c['sigma_max']:.3f}")
+    schedule = sch
 
     for kv in a.override:                       # CLI wins over everything
         k, v = kv.split("=", 1)
@@ -179,13 +251,19 @@ def main():
                                      persistent_workers=c.get("workers", 4) > 0)
 
     # ---- models ----
-    student = build_model(c, dev, schedule)
-    if c.get("teacher_ckpt") and c.get("init_from_teacher", True):
+    # With a registry teacher the student and critic are CLONES of it. That is
+    # not a convenience: it makes `init_from_teacher` exact by construction for
+    # every backbone family, with no architecture config to get wrong and no
+    # state-dict remap to drift. The DiT path keeps rebuilding from config
+    # because RUNPLAN's memory model needs our own DiT.
+    clone = bool(c.get("teacher"))
+    student = clone_trainable(teacher) if clone else build_model(c, dev, schedule)
+    if not clone and c.get("teacher_ckpt") and c.get("init_from_teacher", True):
         student.net.load_state_dict(teacher.net.state_dict())
 
     if c["track"] == "A":
-        critic = build_model(c, dev, schedule)
-        if c.get("teacher_ckpt"):
+        critic = clone_trainable(teacher) if clone else build_model(c, dev, schedule)
+        if not clone and c.get("teacher_ckpt"):
             critic.net.load_state_dict(teacher.net.state_dict())
         tr = DMD2Trainer(wrap_ddp(student, rank, world), wrap_ddp(critic, rank, world),
                          teacher, c, device=dev, schedule=schedule)

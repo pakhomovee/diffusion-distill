@@ -6,6 +6,8 @@ pin a third model in VRAM.
 
 Two on-disk formats are supported, both float16 memmaps:
 
+  "pixels"   (N, 3, H, W)  -- uint8, served in [-1,1]. The cheap tier
+                             (CIFAR-10, ImageNet-64): no VAE in the loop at all.
   "moments"  (N, 8, H, W)  -- mean and logvar. The latent is *resampled* every
                              time the sample is read, which is what DiT trains
                              on and what keeps the dataset from being a frozen
@@ -66,6 +68,31 @@ class LatentDataset(torch.utils.data.Dataset):
         return x, int(self.y[i])
 
 
+class PixelDataset(torch.utils.data.Dataset):
+    """uint8 (N, 3, H, W) memmap, served in [-1, 1]. The cheap tier's data path.
+
+    No VAE, no moments, no resampling -- pixels are the ground truth, so the
+    only transform is the scale. `sigma_data` still comes from meta.json rather
+    than a constant: CIFAR-10 in [-1,1] is not the same spread as ImageNet-64,
+    and `dsm_weight` uses it at every noise level.
+    """
+
+    def __init__(self, root, split="train", flip=False):
+        self.x = np.load(f"{root}/{split}_pixels.npy", mmap_mode="r")
+        self.y = np.load(f"{root}/{split}_labels.npy", mmap_mode="r")
+        self.flip, self.meta = flip, load_meta(root)
+        assert len(self.x) == len(self.y), f"{len(self.x)} pixels vs {len(self.y)} labels"
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, i):
+        x = torch.from_numpy(np.asarray(self.x[i], dtype=np.float32)) / 127.5 - 1.0
+        if self.flip and torch.rand(()) < 0.5:
+            x = x.flip(-1)
+        return x, int(self.y[i])
+
+
 class SyntheticLatents(torch.utils.data.Dataset):
     """Class-conditional low-rank Gaussian mixture in latent shape.
 
@@ -92,6 +119,34 @@ class SyntheticLatents(torch.utils.data.Dataset):
         return self.x[i], int(self.y[i])
 
 
+class GaussianData(torch.utils.data.Dataset):
+    """iid N(0, sd^2 I) samples, matching `teachers.GaussianTeacher`.
+
+    The pair exists so `exp/10_lambda_real.py` can be validated against a target
+    whose true score is known, before it is pointed at a real model whose answer
+    nobody knows. Spec: `gaussian:c=4,hw=8,sd=0.5,n=8192`.
+    """
+
+    def __init__(self, spec="", c=4, hw=8, sd=0.5, n=8192, seed=0):
+        kv = dict(c=c, hw=hw, sd=sd, n=n, seed=seed)
+        for part in spec.split(","):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                kv[k.strip()] = float(v) if "." in v else int(v)
+        g = torch.Generator().manual_seed(int(kv["seed"]))
+        self.shape = (int(kv["c"]), int(kv["hw"]), int(kv["hw"]))
+        self.sd = float(kv["sd"])
+        self.x = torch.randn(int(kv["n"]), *self.shape, generator=g) * self.sd
+        self.meta = dict(sigma_data=self.sd, shape=list(self.shape), n_classes=1,
+                         space="synthetic", format="gaussian")
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, i):
+        return self.x[i], 0
+
+
 def build_dataset(c):
     """Dataset + the config fields the data itself determines.
 
@@ -104,12 +159,21 @@ def build_dataset(c):
     if c["data"] == "synthetic":
         return SyntheticLatents(c.get("n_synth", 8192), tuple(c["shape"]),
                                 c["n_classes"]), {}
-    ds = LatentDataset(c["data"], flip=c.get("flip", False))
-    m = ds.meta
+    if c["data"].startswith("gaussian"):
+        ds = GaussianData(c["data"].split(":", 1)[-1] if ":" in c["data"] else "")
+        return ds, dict(ds.meta)
+    meta = load_meta(c["data"])
+    flip = c.get("flip", False)
+    ds = (PixelDataset(c["data"], flip=flip) if meta.get("format") == "pixels"
+          else LatentDataset(c["data"], flip=flip))
     resolved = {}
-    if m:
-        resolved["sigma_data"] = m["sigma_data"]
-        resolved["shape"] = m["shape"]
-        resolved["latent_size"] = m["latent_size"]
-        resolved["n_classes"] = m["n_classes"]
+    for k in ("sigma_data", "shape", "n_classes", "space"):
+        if k in meta:
+            resolved[k] = meta[k]
+    if "latent_size" in meta:
+        resolved["latent_size"] = meta["latent_size"]
+    elif "resolution" in meta:
+        # pixel data: `latent_size` is the grid the backbone patchifies, which
+        # for a pixel model is the image itself.
+        resolved["latent_size"] = meta["resolution"]
     return ds, resolved

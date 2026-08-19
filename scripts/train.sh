@@ -16,6 +16,9 @@
 #       --gpus IDS          comma-separated ids, e.g. 0,1,2,3 (default: env)
 #       --micro-batch N     per-device batch
 #       --steps N           training steps
+#       --seed N            RNG seed; run dir gets _sN when non-zero. Use 3 seeds
+#                           at CIFAR scale -- FINDINGS.md 6 warns the effect may
+#                           be smaller than run-to-run FID variance there.
 #       --exp-name NAME     run dir under runs/ (default: <dataset>_<mode>)
 #       --config FILE       use this config verbatim, skipping generation
 #       --resume [PATH]     resume ('auto' = latest checkpoint in the run dir)
@@ -34,7 +37,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/common.sh"
 
-DATASET=""; MODE="robust"; GPUS=""; MICRO=""; STEPS=""; EXP_NAME=""
+DATASET=""; MODE="robust"; GPUS=""; MICRO=""; STEPS=""; EXP_NAME=""; SEED=""
 CONFIG=""; RESUME=""; DO_PREPARE=0; SKIP_SETUP=0; DRY_RUN=0
 SETS=(); EXTRA=()
 
@@ -45,6 +48,7 @@ while [[ $# -gt 0 ]]; do
     --gpus)          GPUS="$2"; shift 2 ;;
     --micro-batch)   MICRO="$2"; shift 2 ;;
     --steps)         STEPS="$2"; shift 2 ;;
+    --seed)          SEED="$2"; shift 2 ;;
     --exp-name)      EXP_NAME="$2"; shift 2 ;;
     --config)        CONFIG="$2"; shift 2 ;;
     --resume)        if [[ "${2:-}" == --* || -z "${2:-}" ]]; then RESUME="auto"; shift
@@ -79,7 +83,11 @@ GPUS="${GPUS:-${DEFAULT_GPUS:-0}}"
 NPROC="$(count_gpus "$GPUS")"
 MICRO="${MICRO:-$DEFAULT_MICRO_BATCH}"
 STEPS="${STEPS:-$DEFAULT_STEPS}"
+SEED="${SEED:-0}"
 EXP_NAME="${EXP_NAME:-${DATASET}_${MODE}}"
+if [[ "$SEED" != "0" ]]; then EXP_NAME="${EXP_NAME}_s${SEED}"; fi
+# Per-dataset floor for the Track A effective real batch (FINDINGS.md 1.4 and 5).
+export DD_MIN_REAL_BATCH="${DD_MIN_REAL_BATCH:-${DEFAULT_MIN_REAL_BATCH:-256}}"
 RUN_DIR="$REPO_ROOT/runs/$EXP_NAME"
 export CUDA_VISIBLE_DEVICES="$GPUS"
 export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
@@ -88,13 +96,23 @@ cd "$REPO_ROOT"
 # ---- teacher checkpoint ----------------------------------------------------
 # FINDINGS.md 4.0.1: DiT-XL/2 is the only publicly released latent DiT, so it is
 # the teacher for every run here. Fetch + verify it before anything expensive.
-if [[ -n "${TEACHER_NAME:-}" && ! -f "$TEACHER_CKPT" ]]; then
+if [[ -n "${TEACHER_NAME:-}" && -n "${TEACHER_CKPT:-}" && ! -f "$TEACHER_CKPT" ]]; then
   if [[ "$DRY_RUN" == "1" ]]; then
     log "--dry-run: would fetch teacher $TEACHER_NAME -> $CKPT_DIR (~2.7 GB)"
   else
     log "Fetching teacher $TEACHER_NAME -> $CKPT_DIR"
     python3 -m ddgpu.ckpt --name "$TEACHER_NAME" --dir "$CKPT_DIR"
   fi
+fi
+
+# A registry spec pointing at a local file (edm:..., sit:...) must exist; a
+# hub id (diffusers:...) is fetched on first use and must not be checked here.
+if [[ -n "${TEACHER_SPEC:-}" && "$DRY_RUN" == "0" ]]; then
+  case "$TEACHER_SPEC" in
+    edm:*|sit:*)
+      _tp="${TEACHER_SPEC#*:}"
+      [[ -f "$_tp" ]] || die "teacher not found: $_tp (see scripts/envs/${DATASET}.env)" ;;
+  esac
 fi
 
 # ---- dataset ---------------------------------------------------------------
@@ -121,9 +139,18 @@ if [[ -z "$CONFIG" ]]; then
   MK=(python3 "$SCRIPT_DIR/mkconfig.py" --mode "$MODE" --dataset "$DATASET"
       --data "$DATA_DIR" --out "runs/$EXP_NAME" --micro-batch "$MICRO"
       --steps "$STEPS" --n-classes "$NUM_CLASSES" --latent-size "$LATENT_SIZE"
-      --n-student-steps "${DEFAULT_N_STUDENT_STEPS:-1}"
+      --n-student-steps "${DEFAULT_N_STUDENT_STEPS:-1}" --seed "$SEED"
       --cfg-scale "${DEFAULT_CFG_SCALE:-1.75}" --write "$CONFIG")
-  if [[ -n "${TEACHER_CKPT:-}" ]]; then MK+=(--teacher "$TEACHER_CKPT"); fi
+  # A registry teacher spec wins over a bare checkpoint path: it carries the
+  # preconditioning family, which a path alone does not.
+  if [[ -n "${TEACHER_SPEC:-}" ]]; then
+    MK+=(--teacher-spec "$TEACHER_SPEC")
+  elif [[ -n "${TEACHER_CKPT:-}" ]]; then
+    MK+=(--teacher "$TEACHER_CKPT")
+  fi
+  if [[ -n "${DEFAULT_SIGMA_DIST:-}" ]]; then MK+=(--sigma-dist "$DEFAULT_SIGMA_DIST"); fi
+  if [[ -n "${REPA_DIR:-}" ]]; then MK+=(--repa-dir "$REPA_DIR"); fi
+  if [[ -n "${EDM_REPO:-}" ]]; then MK+=(--edm-repo "$EDM_REPO"); fi
   if [[ "$MODE" == "invert" ]]; then MK+=(--anchor-path "$CKPT_DIR/anchors_${DATASET}.pt"); fi
   if [[ ${#SETS[@]} -gt 0 ]]; then MK+=(--set "${SETS[@]}"); fi
   "${MK[@]}" >/dev/null

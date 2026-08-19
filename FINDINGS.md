@@ -1,7 +1,7 @@
 # Findings and research direction
 
 Consolidated state as of 2026-08-19. Companion documents: `LOG.log` (the running
-narrative, 11 entries, chronological) and `RUNPLAN.md` (GPU budget and memory math).
+narrative, 13 entries, chronological) and `RUNPLAN.md` (GPU budget and memory math).
 This file is the decision document: what we learned, what to pursue, and what each
 GPU run buys.
 
@@ -470,9 +470,129 @@ co-scheduled with 4-GPU jobs on the same node — but see the co-location warnin
   effective real batch wants to be 512, i.e. micro_batch 64 on 8 GPUs. The
   launcher warns when it is not. Not measured; worth one cell of exp04 if the
   first real λ curve looks flatter than the synthetic one.
+- **Phase A cannot produce the mechanism result.** `LambdaEstimator.calibrate`
+  evaluates at noised *real* data, and the DSM identity does not extend to
+  student samples, so §1.2/§3.1 still need a training run. §6.2.
+- **The cheap tier's baseline FID is not a DMD2 reproduction.** Its teachers
+  expose no token trunk, so the discriminator is a standalone conv head rather
+  than DMD2's critic-feature head. Our arms are comparable to each other, not to
+  the published number. §6.5.
+- **The cheap tier's Phase C/D/E GPU-hour estimates are not derived.**
+  `memcalc` is transformer-shaped and those backbones are UNets. Run
+  `ddgpu.probe` before committing to a rental.
 - **The drift probe is a lower bound, not λ\*.** `LambdaProbe` uses the ratio
   statistic, which drops the ⟨b_B, u⟩ term and is loosest at small σ. Read the
   *difference* between the real and student legs, never the levels. The CPU smoke
   run already shows the predicted split (1.000 vs 0.53–0.61), but against a
   synthetic target and an untrained student — that is a wiring check, not
   evidence.
+
+---
+
+## 6. The cheap tier — the plan we are actually running
+
+§4's plan costs ~3,100 GPU-hours core and ~5,000 with ablations and contingency
+(26 days on an 8×5090 node). This section replaces it with a ~200–375 GPU-hour
+programme that keeps the axis the method is at risk on. §4 stays as written: it
+is the plan to spend *if* the cheap tier says the effect is real.
+
+Full derivation and the traps found along the way: **LOG.log ENTRY 013**.
+
+### 6.1 What shrinks is parameters, not dimension
+
+| tier | setup | working dims | teacher params |
+|---|---|---:|---:|
+| expensive | DiT-XL/2 @256px **latent** | 4,096 | 674.82 M |
+| expensive | DiT-XL/2 @512px **latent** | 16,384 | 674.82 M |
+| **cheap** | CIFAR-10 @32px **pixel** | 3,072 | ≈36 M |
+| **cheap** | ImageNet-64 @64px **pixel** | 12,288 | ≈296 M |
+| **cheap** | ImageNet-100 @256px **latent** | 4,096 | ≈130 M (self-trained SiT) |
+
+The ladder ratio is preserved exactly — 4,096→16,384 becomes 3,072→12,288, both
+4×, 25% lower in absolute terms. Parameters drop 19× at the low rung.
+
+**The point that is easy to get backwards: ImageNet-64 in pixel space is 3×
+higher-dimensional than ImageNet-256 in latent space** (12,288 vs 4,096). The
+VAE exists to make high *resolution* cheap; it does not make the working
+dimension small. Reading "256px → 64px" as a 16× retreat confuses resolution
+with dimension, and dimension is what §1.3 says this method breaks on.
+
+Relatedly, DiT-XL/2 is 674.82 M parameters at *both* 256px and 512px — identical
+count, 4× the tokens. Capacity tracks distribution complexity and noise-level
+coverage, not pixel count; that is why CIFAR-10 saturates at ≈36 M while
+ImageNet-64, on a smaller grid, needs ≈296 M.
+
+### 6.2 Phase A — the λ ladder is inference, and it is falsifiable
+
+λ_dsm needs a teacher, real data, and forward passes. No student, no critic, no
+optimiser. So the ladder from 3,072 to **16,384** dims — including the DiT-XL/2
+@512 leg, on a 50k-image subset rather than the 84 GB full prep — is ~10 GPU-h.
+
+`exp/10_lambda_real.py` emits three things, and they are not equally strong:
+
+1. **Falsifiable — the held-out gain.** λ is estimated on split 1; the denoising
+   loss `E‖λA+(1−λ)B−g‖²` is evaluated on a *fresh* split 2. Since that loss is
+   `MSE(λ) + const(σ)`, a reduction in it *is* a reduction in true score MSE,
+   with no ground truth. If `gain_vs_teacher` is not below 1.0, the method does
+   not work at that dimension — a real negative result for a few GPU-hours.
+   The identity itself is verified on real tensors against a Gaussian target in
+   `tests/test_teachers.py:t_dsm_identity`.
+2. **Descriptive — λ_dsm(σ).** §1.1's shape on a real image model.
+3. **Comparative only — the off-manifold panel.** Ratio statistic at perturbed
+   real data (blur/shift/collapse, mirroring §1.2's rows). A *lower bound* on
+   λ*: compare its two legs, never the levels.
+
+**Phase A cannot produce the mechanism result.** `LambdaEstimator.calibrate`
+evaluates at noised *real* data (`robust.py`), and the DSM identity does not
+extend to student samples — `g = −ε/σ` is unbiased for the score of whatever
+distribution `x0` came from. §1.2 and §3.1 need a student, i.e. Phase C.
+
+### 6.3 The plan
+
+| phase | what | est. GPU-h |
+|---|---|---:|
+| A | λ ladder + held-out gain across 5–6 released teachers, inference only | ~10–15 |
+| C | CIFAR-10 `dmd2` vs `robust`, **3 seeds each** | ~120–240 |
+| D | ImageNet-64 pair — **required, not optional** | ~60–120 |
+| E | ImageNet-100 latent leg (self-trained SiT teacher) | ~40–80 |
+| | | **~230–455** |
+
+**Phase D is required.** Without it the trained evidence stops at 3,072 dims
+while the measured evidence reaches 16,384 — a 5× gap.
+
+**Phase E is the answer to "does this hold in latent space?"** — the one
+reviewer question the rest of the cheap tier cannot address. It costs no teacher
+compute because the SiT-B/2 already exists (repa-surgery, ImageNet-100, 300k
+steps, FID ≈16 at 250k). It doubles as §4 Run 3's teacher-capacity probe: that
+teacher is deliberately weaker than the released ones, so λ should sit *lower*
+if λ is driven by teacher bias.
+
+The C/D/E estimates are **not derived** — `memcalc` is transformer-shaped and
+these are UNets. Firm them up with `ddgpu.probe` before committing.
+
+### 6.4 Three seeds, because the effect may be smaller than the noise
+
+§2 already names "6–9% mean score-MSE may not move FID" as the biggest risk, and
+going smaller does not reduce it: one-step CIFAR-10 distillation is
+near-saturated (published FIDs ~2–4). One run per arm cannot distinguish "no
+effect" from "effect smaller than noise".
+
+`ddgpu.eval --seeds` groups `_sN` runs, reports mean ± sd, and prints an explicit
+standard-error verdict — refusing to call a win inside one se, or with fewer
+than 3 seeds per arm.
+
+### 6.5 What the cheap tier gives up
+
+- **No trained latent result at ImageNet scale**, and no competitive
+  ImageNet-256 FID table. Phase E covers latent space at 4,096 dims and 100
+  classes; that is not the same claim.
+- **Trained evidence tops out at 12,288 dims; measured evidence reaches 16,384.**
+- **The cheap tier's baseline FID is not comparable to DMD2's published number.**
+  Its teachers expose no token trunk, so the discriminator is a standalone conv
+  head (`gan.ConvGANHead`) rather than DMD2's critic-feature head. Both arms use
+  the identical head and the method arm uses none, so *our* comparison stands —
+  but the absolute number is ours, not a reproduction.
+
+This is a de-risking plan, not a final-paper plan. If Phase A's held-out gain and
+Phase C/D's seeded FIDs both come out positive, §4's budget is worth spending and
+the ENTRY 012 pipeline is still there to spend it with.

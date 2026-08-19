@@ -2,6 +2,13 @@
 
 Target hardware: **NVIDIA RTX 5090, 32 GiB GDDR7, no NVLink (PCIe 5.0 x16 only).**
 
+> **This document budgets the ~5,000 GPU-hour ImageNet-256/512 programme, which
+> is NOT what we are running first.** `FINDINGS.md` §6 replaces it with a
+> ~230–455 GPU-hour cheap tier (CIFAR-10 at 3,072 dims, ImageNet-64 at 12,288,
+> a self-trained SiT latent leg at 4,096) that preserves the 4× dimension ladder
+> while cutting teacher parameters 19×. Come back here when the cheap tier says
+> the effect is real. The numbers below stay valid for that decision.
+
 > **The teacher is DiT-XL/2 for every run** (FINDINGS.md §4.0.1, decided in
 > favour of option 1). That makes the ladder XL@256 vs XL@512 rather than
 > DiT-B/2, so the DiT-B rows below are only reachable if we ever pretrain our own
