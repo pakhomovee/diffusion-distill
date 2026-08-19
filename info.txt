@@ -1,0 +1,100 @@
+Short answer: transfer is decent for ranking methods, poor for hyperparameters, and specifically bad for the two ideas you’d most want to test — because the thing that breaks kernel methods is latent dimension, and that’s exactly what changes.
+
+What transfers from SD1.5 → SDXL
+
+Method ordering. If A beats B at SD1.5 under matched compute, it usually still does at SDXL.
+Qualitative failure modes: mode collapse, oversaturation, texture artifacts, the diversity/FID trade.
+Ratios rather than absolutes: generator-vs-critic learning rate ratio, critic update frequency, relative loss weights.
+What doesn’t
+
+Anything dimension-dependent. SD1.5 at 512px is a 4×64×64 = 16k-dim latent; SDXL at 1024px is 4×128×128 = 65k. That’s 4× the dimension, and median-heuristic bandwidths scale like √d. Kernel bandwidth, patch size, and the effective batch needed for a usable MMD/KSD estimate all shift. Your #1 and #4 are the least transferable class of result in this literature. A patched-Stein operator that works beautifully at 16k dims can hit a cliff at 65k, and you won’t see it coming from SD1.5.
+CFG interaction. SDXL is distilled at high guidance (DMD2 used scale 8 for the real score), and guidance distillation couples strongly with whatever divergence you pick.
+Adversarial stability. GAN terms that are docile at SD1.5 diverge at 2.6B params.
+Engineering: SDXL’s dual text encoders, pooled embeds, and size/crop conditioning are a real week of plumbing.
+Compute for SDXL
+
+The canonical figure: DMD2 trained the SDXL student on 64 A100s for approximately 60 hours — about 3,840 A100-hours per run, roughly $4–8k at spot pricing. But that’s the 2024 recipe and it’s no longer the floor. SenseFlow distills SDXL, SD3.5-Large, and FLUX.1-dev on 8 A100s with total batch size 8, using FSDP, and newer work reports 71 GPU-hours on SD3-Medium (2B) and 104 GPU-hours on SD3.5-Large (8B). LoRA critics are the main lever — applying LoRA to both student and critic at rank 64 collapses the memory problem.
+
+That memory problem is the real constraint: DMD-style training holds three copies of a 2.6B UNet (student, fake score, frozen teacher), and Adam states for the two trainable ones alone run ~80GB. FSDP or ZeRO isn’t optional.
+
+So a realistic budget: 8×A100-80GB, 1–3 days per run, with a LoRA critic. Plan for 6–10 runs including the baseline reproduction. That’s an 8-GPU node for about a month.
+
+The move I’d actually make
+
+Decouple the two axes. Your risk is dimension, your budget constraint is parameters — and you can separate them. Test at high latent dimension with a small model:
+
+PixArt-Σ (~0.6B DiT) at 1024px gives you SDXL’s latent dimension at a quarter of the parameters.
+Or cleaner: a latent DiT on ImageNet at 256 vs 512 px. Same architecture, same data, 4k → 16k dims. Cheap, and it’s a controlled dimension ablation rather than a confounded model swap.
+Then run your Stein/kernel method across that dimension ladder and fit the degradation curve before committing to SDXL. Graceful decay means extrapolate with confidence; a cliff means you’ve saved yourself a month and you’ve got a real negative result about Stein operators in high dimension, which is publishable in its own right.
+
+This also reinforces the sequencing from before. Idea #3 is a scalar weighting curve λ*(t) — nearly dimension-free, so SD1.5 or even ImageNet-64 evidence extrapolates honestly. Ideas #1 and #4 are the ones that genuinely need the dimension ladder. Do #3 first on 8 GPUs while you build the harness, and let it tell you whether your DMD2 baseline reproduction is trustworthy before you spend SDXL money.
+
+
+
+I’ll check the current literature before claiming anything is unexplored.
+
+I searched the recent literature first, since the value here is in what’s not there. Some quick clearing of ground: transport-cost-regularized DMD is taken (RDMD, ICML’26), the divergence-family axis is crowded (f-distill, Di-Bregman density-ratio matching, VarDiU’s variational upper bound), and random-network feature MMD as a DMD add-on exists (Embedding Loss). Trajectory-distribution hybrids exist too (TDM). Avoid those.
+
+Here’s my reframing of where the actual gaps are.
+
+The unifying observation: every method estimates ∇_θ D(p_θ ‖ p_target) and differs only in (i) which discrepancy, (ii) what critic represents it, (iii) what geometry the critic measures in. The field has explored (i) exhaustively and (ii) partially. (iii) is nearly untouched, and there’s a fourth axis nobody names: the estimator’s variance, as distinct from the objective.
+
+
+1. Kernel Stein discrepancy distillation — kill the auxiliary network entirely
+
+Every distribution-matching method uses the teacher score as a vector field to subtract. But a known score plus samples is exactly the setting for KSD:
+
+KSD²(q‖p_t) = E_{x,x’~q}[u_{p_t}(x,x’)], with u built from s_teacher(x), s_teacher(x’) and kernel derivatives.
+
+Both x and x’ are student samples. No fake-score network, no discriminator, no real data. That’s ~2–3× less memory than DMD2 and removes the inner-loop instability that forces two-timescale tricks.
+
+Why it hasn’t been tried: KSD is famously blind to mixture-weight errors in high dimensions. But the diffusion structure specifically defeats that failure mode — averaging over noise levels means a weight error at low t becomes a location error at moderate t, which KSD does detect. An annealed/multi-scale KSD argument hasn’t been made, let alone tested. Bonus: the U-statistic form gives O(1/B²) gradient variance instead of O(1/B).
+
+Hard part, and where the paper lives: a per-patch Stein operator. The teacher score restricted to a patch is not the patch marginal’s score. The fix is a diffusion Stein operator with matrix-valued m = patch projector — still zero-mean, still valid, and it connects your MMD²-patched line to the score-based line under one operator.
+
+2. Distill in noise space, not data space
+
+Everyone matches distributions in the 16k-dim latent/pixel space, where we don’t know the target. The Gaussian prior is the one distribution we know exactly — linear score, closed-form moments, well-conditioned MMD.
+
+Train an inverse map E_φ jointly with G_θ: cycle consistency E(G(z))≈z and G(E(x))≈x, plus a Gaussianity discrepancy on E(x) for real x, anchored by a few-step DDIM inversion of the teacher. This converts “match an unknown intractable distribution” into “match an isotropic Gaussian” (easy) plus “learn a bijection” (regressable). All the statistical difficulty is moved somewhere with closed-form answers. Side payoff: one-step models currently have no native inversion — you’d get editing for free.
+
+Risk: E and G colluding toward a degenerate map; the teacher anchor and real-data term must prevent it.
+
+3. Doubly-robust distillation — derive the GAN term instead of bolting it on
+
+DMD2, ADD, and LADD all empirically need a real-data adversarial term with a hand-tuned weight. And distilled students routinely beat their teachers — which means this isn’t distillation, it’s regularized re-estimation, and the real-data term is silently correcting teacher score error.
+
+Formalize it: you have two estimators of s_data(x_t) — the teacher (low variance, biased) and a denoising-score-matching estimate from a real minibatch (unbiased, high variance). The variance-optimal convex combination has a closed-form t-dependent weight λ*(t) = Cov/Var, estimable online. This makes a falsifiable prediction: λ* should be teacher-heavy at high t and data-heavy at low t, exactly where discriminators empirically help.
+
+Control variates exist in SDS (SteinDreamer) and in score-matching training (CVSI), but nobody has framed teacher-vs-data fusion in distillation this way. Lowest risk, highest ROI: it’s a drop-in DMD2 modification that replaces a hyperparameter with an estimated quantity.
+
+4. Teacher-derived kernel geometry
+
+Patched MMD uses isotropic kernels on raw patches — a provably wrong metric for images. LADD fixed this adversarially. The non-adversarial fix: a Mahalanobis kernel k_t(x,x’) = exp(−½(x−x’)ᵀM_t(x−x’)) with M_t from the teacher’s score Jacobian ∇_x s_t (the local Fisher metric of the noised data distribution), applied via JVPs. No extra network. This makes the kernel sensitive along data-manifold directions and blind off-manifold — which is the curse-of-dimensionality problem in MMD. Equivalently: sliced Wasserstein with slices from the top eigenspace of the score Jacobian.
+
+Cheapest to prototype of the five. Good ablation companion to #1.
+
+5. Distributionally-robust weighting over noise level
+
+Everyone samples t from a hand-picked schedule with fixed weighting, but the bottleneck noise level shifts during training. Make w(t) a minimax variable with a KL trust region — DRO over the simplex on t, auto-allocating gradient budget to the currently-worst noise level. ~20 lines, applies on top of any existing method, and I found nothing doing it. Weak paper alone; strong as a component.
+
+
+If I had to pick: #3 first (it explains existing folklore and is a two-week experiment), then #1 as the ambitious swing — a genuinely critic-free distillation method would be a real result, and the patch-Stein-operator problem is the kind of technical obstacle that makes a paper rather than kills it. #2 is the highest-variance bet but the most different in kind.
+
+One methodological warning: FID at matched step count will mislead you here. #1 and #3 change memory and per-step cost substantially, so compare at matched wall-clock, and always report precision/recall separately — mode-seeking objectives buy FID with diversity, and that trade will hide inside a single number.
+
+
+
+Yes — but the papers differ a lot in how much they depend on “if they work.”
+
+#3 (doubly-robust) is the only one that publishes even if the numbers are flat. That’s its real advantage. The contribution is explanatory: you derive the real-data/adversarial term that DMD2, ADD, and LADD all add by hand, and you produce λ*(t) as a measured curve. If λ*(t) comes out teacher-heavy at high noise and data-heavy at low noise, you’ve explained a piece of folklore with a testable prediction, and on-par FID with one fewer hyperparameter is a perfectly respectable result. If λ*(t) comes out flat or the opposite shape, that’s also interesting — it falsifies the standard story about why discriminators help. Hard to end up with nothing. Realistic venue: NeurIPS/ICML main track, not a best-paper, but solid.
+
+#1 (KSD) is binary and has the highest ceiling. A genuinely critic-free distillation method — no fake score net, no discriminator — is a headline claim, and the efficiency story (2–3× memory) means you can win at slightly worse FID, which is a rare escape hatch in this literature. But the failure mode is sharp: if the patch-Stein operator degenerates above ~32×32, you have a toy-scale workshop paper. I’d want the theory as insurance — a proposition that the noise-annealed KSD separates distributions in regimes where plain KSD provably doesn’t. That’s provable and it makes the paper survive weaker empirics.
+
+#2 (noise-space) has a built-in fallback. It needs both halves — Gaussianization and the bijection — to deliver a distillation paper. But if only the inverse map works, you pivot to “native inversion and editing for one-step diffusion models,” which is a real open problem with an established evaluation protocol. Different paper, still a paper. That asymmetry makes it less risky than it looks.
+
+#4 and #5 are sections, not papers. Fisher-metric kernels bundle naturally into #1 (the kernel-geometry ablation is half the empirical story anyway); DRO weighting over t is a two-page component that strengthens whatever it’s attached to. Don’t try to stand either up alone — reviewers will call them incremental and they’d be right.
+
+The thing that will actually decide this isn’t the idea, it’s scale. Distillation reviewing has drifted hard: CIFAR-10 and ImageNet-64 alone now read as insufficient regardless of how clean the method is. You’ll need at least one text-to-image result at SDXL/FLUX scale, plus a reproduced DMD2 baseline at matched wall-clock — and reproducing that baseline is usually more compute than developing your method. Budget for it explicitly before committing. If you only have small-scale compute, #3 is the right choice, because a variance-optimal-weighting claim is defensible at ImageNet-64 in a way that a new divergence isn’t.
+
+Two practical notes. First, sequence them: #3 is a two-to-three week experiment on top of an existing DMD2 codebase, and running it first tells you whether your baseline and evaluation harness are trustworthy before you sink months into #1. Second, my novelty check was a handful of searches in August 2026 — do a proper sweep of the last three months of arXiv on each before you commit, since this area produces near-duplicates fast and RDMD already ate the OT-regularization idea.

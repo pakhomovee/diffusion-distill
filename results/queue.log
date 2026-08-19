@@ -1,0 +1,10 @@
+[queue] exp02 finished, starting exp03
+[queue] exp03 finished, starting exp04
+[queue] exp04 finished
+[queue2] starting exp06 d=32
+[queue2] exp06 d=32 finished
+wrote fig1_lambda.png
+wrote fig2_power_dim.png
+wrote fig3_power_batch.png
+wrote fig4_ladder.png
+[queue2] figures regenerated

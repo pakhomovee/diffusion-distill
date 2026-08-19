@@ -1,0 +1,94 @@
+# diffusion-distill
+
+Two research tracks on diffusion distillation, sharing one harness.
+
+**Track A — doubly-robust distillation** (info.txt idea #3). Replaces DMD2's
+hand-weighted real-data adversarial term with a variance-optimal convex
+combination of the teacher score and a closed-form minibatch empirical score,
+at a weight λ(σ) that is *estimated online* rather than tuned. No discriminator,
+no extra network, one fewer hyperparameter.
+
+**Track B — invertible / noise-space distillation** (info.txt idea #2). Learns a
+generator G and an approximate inverse E jointly, and does the distribution
+matching in noise space where the target is exactly N(0,I). E replaces the
+fake-score critic rather than adding to it, so the memory footprint matches the
+DMD2 baseline. Side payoff: native inversion for a one-step model.
+
+## Status
+
+| | status |
+|---|---|
+| exp01 λ*(σ) vs closed-form ground truth | done — falsifies the folklore, LOG ENTRY 001 |
+| exp02/03 Gaussianity power vs dim & batch | done — LOG ENTRIES 005–007 |
+| exp04 dimension ladder, 234 cells | done — LOG ENTRIES 009–010; found the d=512 cliff |
+| exp07/08 dimension-transferable λ | done — LOG ENTRY 011; **gate deleted, zero tuned hyperparameters** |
+| exp06 end-to-end toy distillation | running |
+| GPU codebase (both tracks) | written, smoke-tested end-to-end; 29 invariant tests passing |
+| GPU budget | RUNPLAN.md — derived, not guessed |
+| GPU runs | not started (no GPU on this box) |
+
+## Layout
+
+```
+FINDINGS.md consolidated findings + research direction + per-run justification
+dd/         CPU harness: closed-form GMM target, exact noised score, estimators
+ddgpu/      the real codebase (DiT, EDM, DMD2, Track A, Track B, eval, budget)
+exp/        experiments; 01 = lambda curve, 02/03 = Gaussianity power, plan_gpus
+configs/    13 run configs incl. two CPU smoke configs
+results/    json + logs
+LOG.log     running research log — findings, derivations, bugs, decisions
+RUNPLAN.md  GPU counts, memory math, wall-clock, sequencing
+```
+
+## Quick start
+
+```bash
+# de-risking, no GPU needed
+python exp/01_lambda_curve.py --d 32 --steps 6000     # lambda*(sigma), ~7 min
+python exp/02_gauss_power.py 100                      # discrepancy power vs dim
+python exp/04_lambda_ladder.py                        # dimension / batch / off-dist
+python exp/08_dsm_calibrated_lambda.py                # the estimator that ships
+python exp/plan_gpus.py                               # regenerate the GPU table
+python tests/test_all.py                              # 29 invariant tests
+
+# smoke tests, CPU-safe, ~15 s each
+python -m ddgpu.train --config configs/smokeA.json
+python -m ddgpu.train --config configs/smokeB.json
+
+# on the GPU VM: measure before you budget
+python -m ddgpu.probe --sweep
+torchrun --nproc_per_node=2 -m ddgpu.train --config configs/dit_b_256_robust.json
+```
+
+## The two results that matter
+
+**1. The folklore is backwards.** `exp01` measures λ*(σ) against a closed-form
+ground-truth score — the one thing a GPU cannot do better than a laptop. λ* comes
+out teacher-heavy at *low* noise and data-heavy at *high* noise, the opposite of
+the standard explanation for why real-data terms help in DMD2/ADD/LADD. `exp04`
+then shows the picture **inverts off the data manifold**, which reframes the
+mechanism: the real-data term corrects the teacher where the teacher was never
+trained, not on the manifold. LOG ENTRIES 001, 009.
+
+**2. λ is the minimiser of a held-out denoising loss.** A σ-gated online rule
+looked fine at d ≤ 128 and collapsed at d=512 (3.2× worse than baseline, 21× in
+its worst bucket) — the dimension cliff. The fix, `exp08`:
+
+```
+λ(σ) = E⟨A − B, g − B⟩ / E‖A − B‖²      g = −ε/σ on held-out real data
+```
+
+exact, ground-truth-free, and dimension-transferable by construction. It
+reproduces λ* to three decimals at d=512 and leaves Track A with **zero tuned
+hyperparameters** in its λ path. LOG ENTRY 011.
+
+## Reading order
+
+1. **`FINDINGS.md`** — start here. What we learned, which paths to pursue, and
+   what each GPU run buys, with decision gates.
+2. `RUNPLAN.md` — GPU counts, memory math, wall-clock, sequencing.
+3. `LOG.log` — the chronological research narrative, newest entry last. Read this
+   when you need to know *why* something is the way it is, including the things
+   that were tried and abandoned.
+4. `ddgpu/robust.py` and `ddgpu/invertible.py` — the two methods; the module
+   docstrings carry the derivations and the known failure modes.

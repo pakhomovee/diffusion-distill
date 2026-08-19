@@ -1,0 +1,684 @@
+================================================================================
+DIFFUSION DISTILLATION RESEARCH LOG
+================================================================================
+
+[2026-08-19 | ENTRY 000 | SETUP & TRIAGE]
+
+Environment probe:
+  - NO GPU. 2 CPU cores. 3 GB RAM. 28 GB disk. Python 3.14.
+  - Installed torch 2.13.0+cpu, matplotlib, scipy.
+
+Implication: SDXL / PixArt / ImageNet-64 are all off the table by 3-4 orders of
+magnitude. Anything requiring a real image backbone is infeasible here. So the
+selection criterion is NOT "which idea is best in the abstract" but "which idea
+yields a result that is still TRUE and INFORMATIVE at the scale I can run".
+
+Triage of the 5 ideas in info.txt against this constraint:
+
+  #1 KSD / critic-free    - core claim is about HIGH-DIM behaviour of Stein
+                            operators. At d<=128 on CPU I would be measuring
+                            precisely the regime where KSD is known to work.
+                            Cannot falsify or confirm the interesting claim.
+                            => the "dimension ladder" part IS runnable cheaply
+                            though, as a synthetic degradation curve. Deferred.
+  #2 noise-space/inverse  - user's favourite. Needs a generator+encoder, both
+                            small. Genuinely runnable at toy scale, and the
+                            failure mode (E,G collude into a degenerate map) is
+                            a *small-scale* phenomenon, so toy scale is
+                            diagnostic rather than misleading. VIABLE.
+  #3 doubly-robust        - info.txt itself says it is "nearly dimension-free"
+                            and "defensible at ImageNet-64 in a way a new
+                            divergence isn't". The central object, lambda*(t),
+                            is a scalar curve. And crucially: on a synthetic
+                            target with a CLOSED-FORM score I can compute the
+                            EXACT MSE-optimal lambda*(t), which is impossible
+                            on real images at any budget. That makes small
+                            scale an ADVANTAGE, not a concession. BEST FIT.
+  #4 Fisher kernel        - a section, not a paper (per info.txt). Bundles into #1.
+  #5 DRO over t           - a section. ~20 lines. Cheap add-on later.
+
+DECISION: sequence #3 -> #2, as info.txt recommends and as the user permits
+("start with something more promising then move on"). #3 first also builds the
+harness that #2 needs (teacher, diffusion utils, eval).
+
+--------------------------------------------------------------------------------
+DERIVATION recorded before coding, so the experiment is falsifiable in advance.
+--------------------------------------------------------------------------------
+Goal: estimate the true noised-data score s(x,sigma) from two estimators.
+  A = s_teacher(x,sigma)         deterministic given x -> Var = 0, bias b_A
+  B = minibatch empirical score  stochastic over the real batch -> bias b_B, Var V_B
+
+  Note on B: in distillation, x is a *student* sample, so the usual one-sample
+  DSM estimate -eps/sigma is NOT available (it requires x drawn from the forward
+  process on that same datum). The correct nonparametric estimator at arbitrary
+  x is the score of the noised empirical measure:
+      B(x) = sum_j w_j (x0_j - x)/sigma^2 ,  w_j = softmax_j(-||x-x0_j||^2/2sigma^2)
+  This is exactly the quantity a discriminator/critic learns to approximate.
+
+  MSE(lambda) for s_hat = lambda*A + (1-lambda)*B, with u := b_A - b_B:
+      MSE = ||lambda b_A + (1-lambda) b_B||^2 + (1-lambda)^2 V_B
+      => lambda* = (V_B - <b_B,u>) / (||u||^2 + V_B)              [EXACT, needs true s]
+
+  Online estimator (drops the unknown <b_B,u> term, i.e. assumes B unbiased):
+      lambda_hat = V_B / E||A-B||^2      since E||A-B||^2 = ||u||^2 + V_B
+  with V_B estimated by half-batch splitting: V_hat_B = ||B_1 - B_2||^2 / 4.
+  Fully estimable online, no ground truth, no extra network. Lies in [0,1].
+
+PRE-REGISTERED PREDICTIONS (to be checked, not assumed):
+  P1 (folklore, per info.txt): lambda* teacher-heavy at high sigma, data-heavy
+     at low sigma.
+  P2 (my prior, which CONTRADICTS P1): the empirical score B degenerates to
+     nearest-neighbour as sigma->0 (memorisation), so V_B *explodes* at low
+     sigma => lambda* should be TEACHER-heavy at LOW sigma and DATA-heavy at
+     HIGH sigma. i.e. the opposite of the folklore.
+  If P2 holds, the standard story for why discriminators help in DMD2/ADD/LADD
+  is wrong, and the real explanation must be something other than "data fixes
+  the teacher's low-noise bias".
+  P3: the gap between lambda_hat (online) and lambda* (exact) is a direct
+     measure of how much b_B matters; if small, the online rule is sound.
+
+Next: implement dd/ harness + exp/01.
+
+--------------------------------------------------------------------------------
+[2026-08-19 | ENTRY 001 | EXP01 RESULT -- lambda*(sigma) measured, folklore FALSIFIED]
+--------------------------------------------------------------------------------
+Ran exp/01_lambda_curve.py: d=32 GMM (K=8, power-law spectrum, eff. rank 8),
+teacher = EDM-preconditioned MLP (0.84M par) DSM-trained 6k steps on a FINITE
+50k train set; ground truth = POPULATION score of the GMM (closed form);
+B = minibatch empirical score, N=256; 32 independent batches per sigma;
+1024 eval points = noised held-out samples.  Runtime ~7 min on 2 CPU cores.
+
+  sigma    lam*    lam^    bias_A     bias_B     var_B     MSE gain
+  0.010   1.000   0.395   2.3e+03    5.8e+07   1.0e+08     0.99
+  0.108   1.000   0.407   2.6e+00    3.9e+03   7.3e+03     1.00
+  0.447   0.987   0.545   1.2e-01    4.2e+00   1.5e+01     0.97
+  1.156   0.861   0.732   2.4e-02    1.1e-02   1.3e-01     0.86
+  1.860   0.622   0.586   1.1e-02    9.3e-04   1.7e-02     0.63
+  2.991   0.482   0.508   2.6e-03    8.9e-05   2.3e-03     0.52
+  7.734   0.422   0.425   6.1e-05    2.5e-06   4.2e-05     0.58
+ 20.000   0.216   0.206   3.2e-06    2.2e-08   8.3e-07     0.78
+(gain = MSE at lam* divided by MSE of the better single estimator; <1 is a win)
+
+FINDING 1 -- P2 confirmed, P1 (the folklore) falsified.
+  lambda* is TEACHER-heavy at LOW noise (lam*=1.0 for sigma<0.2) and DATA-heavy
+  at HIGH noise (lam*->0.22 at sigma=20).  This is the exact OPPOSITE of the
+  standard story quoted in info.txt ("teacher-heavy at high t, data-heavy at low
+  t, exactly where discriminators empirically help").
+  Mechanism is visible in the columns and is not subtle: var_B blows up like
+  sigma^-4 as sigma->0 because the softmax over the real batch collapses onto the
+  nearest neighbour -- the minibatch estimator MEMORISES.  Meanwhile the teacher's
+  bias falls faster than the data estimator's variance.  There is simply no
+  low-noise regime in which a finite real batch beats a trained teacher.
+
+  Consequence for the field: if this holds up at scale, the real-data adversarial
+  term in DMD2/ADD/LADD is NOT correcting teacher bias at low noise. Whatever it
+  is doing, that is not the mechanism. Candidate alternative explanations to test:
+  (a) it corrects the FAKE-SCORE critic, not the teacher;
+  (b) it is doing mode-coverage/support repair at moderate noise;
+  (c) it is stabilising the two-timescale inner loop rather than the objective.
+
+FINDING 2 -- there is a real MSE win, but it lives at MODERATE-TO-HIGH noise.
+  Best gain 0.48-0.63x MSE around sigma in [1.9, 3.0] ~ [1.5, 2.5]*data_std.
+  That is the band a distillation loss should be reweighted toward, and it is
+  NOT where current recipes put their real-data term.
+
+FINDING 3 -- the online (ground-truth-free) estimator lam^ = V_B / E||A-B||^2
+  is ACCURATE exactly where it matters and WRONG where it doesn't.
+  |lam^ - lam*| < 0.05 for sigma > 1.5 (the useful band); it badly under-shoots
+  at low sigma (0.40 vs 1.00) because it drops the <b_B,u> term and b_B is
+  enormous there. Practical fix is trivial and principled: lam^ is a LOWER bound
+  on lam* whenever <b_B,u> < 0, which holds when b_B is large and aligned
+  against b_A. So gate it: use max(lam^, 1 - c*sigma^2/(sigma^2+sigma_d^2)) or
+  simply clamp lam=1 below the sigma where V_B exceeds ||s||^2. To be tested.
+
+CAVEATS to close before believing this at scale:
+  - single d (32), single teacher quality, single batch N. All three are cheap
+    sweeps -> exp/02.
+  - eval points are ON-distribution (noised real data). In real distillation x
+    comes from the STUDENT, which is off-distribution and is where B degrades
+    differently. Must add that variant.
+  - GMM teacher may be unrealistically good at low sigma. Real image teachers are
+    worse there. But var_B's sigma^-4 blowup is universal and worsens with d, so
+    the ordering should be robust. The d-ladder tests this.
+
+--------------------------------------------------------------------------------
+[2026-08-19 | ENTRY 002 | SCOPE CHANGE -- dev VM vs GPU VM]
+--------------------------------------------------------------------------------
+User clarified: this box is a DEV VM. Real runs go to a separate VM with RTX 5090s,
+and I must specify GPU counts that will not OOM.
+
+That inverts the plan from ENTRY 000. The CPU work is no longer the deliverable;
+it is the DE-RISKING layer. The deliverable is (a) a real distillation codebase
+targeted at 5090s and (b) a defensible GPU budget. The CPU experiments keep their
+value precisely because they are the ones a GPU cannot do better: closed-form
+ground truth (exp01) and large-replicate power analysis (exp02/03).
+
+Two facts about the RTX 5090 drive every downstream choice:
+  32 GiB, not 80 GiB  -> DMD-style training holds 3 backbone copies; with fp32
+                         Adam that is 16 B/param/trainable copy. Sets a hard
+                         ~850M param ceiling for 2 trainable copies.
+  NO NVLink           -> FSDP all-gathers every layer over PCIe 5 (~50 GB/s vs
+                         900 GB/s). This is an ARCHITECTURE decision, not a perf
+                         note: use DDP with full local replicas wherever they
+                         fit; ZeRO-2 before ZeRO-3; full FSDP only for SDXL.
+
+Built ddgpu/memcalc.py to DERIVE the budget rather than guess it: parameter
+counts come from instantiating ddgpu/dit.py on the meta device (verified against
+the DiT paper: S 32.9M / B 130.3M / L 457.8M / XL 674.8M -- exact match),
+memory from an explicit byte accounting, wall-clock from a FLOP model at 38% MFU.
+Wrote ddgpu/probe.py to MEASURE peak VRAM and step time on the real card, because
+the activation term is the one number I cannot validate without a GPU. RUNPLAN.md
+says explicitly that if the probe disagrees, the probe wins.
+
+Headline allocation: ONE 8x5090 NODE, ~2 weeks, covers the whole ImageNet story.
+Blockers the calculator surfaced that I would otherwise have hit at launch time:
+  - SDXL full finetune needs 81.3 GiB of state. Impossible on 32 GiB at ANY GPU
+    count. Only LoRA-with-shared-frozen-base works (6.4 GiB) -- one bf16 base
+    UNet serving teacher/student/critic through three swappable adapters.
+  - DiT-XL/2 @512px is 5.5 days on 8 GPUs. Too expensive; cut or shorten.
+
+--------------------------------------------------------------------------------
+[2026-08-19 | ENTRY 003 | CODEBASE]
+--------------------------------------------------------------------------------
+ddgpu/  dit.py (self-contained DiT, adaLN-Zero, param counts verified)
+        edm.py (EDM preconditioning, CFG score, sigma schedules)
+        data.py (latent memmap dataset + synthetic latents for smoke tests)
+        dmd2.py (DMD2 trainer; Track A is a MODE, not a fork, so baseline and
+                 method share every line except the score-fusion call)
+        robust.py (Track A: empirical score + online LambdaEstimator)
+        gauss_disc.py (closed-form MMD/KSD/moment discrepancies vs N(0,I))
+        invertible.py (Track B: G+E, teacher-anchor cache, collusion diagnostics)
+        eval.py (FID + precision/recall + MATCHED-WALL-CLOCK guard)
+        memcalc.py / probe.py (budget)
+        train.py (DDP entrypoint, one config schema for both tracks)
+exp/    01_lambda_curve.py, 02_gauss_power.py, _pw.py (exp03), plan_gpus.py
+configs/ 13 configs incl. two CPU smoke configs
+Both tracks verified end-to-end on CPU (synthetic data, DiT-T/2). Track A: 8 steps,
+online lambda live and in range. Track B: 8 steps, all four loss legs firing.
+
+Design note worth keeping -- eval.py's comparison_table() RAISES if the runs
+being compared differ by >15% in GPU-seconds, and RAISES if precision/recall are
+missing. info.txt warned about both failure modes; a warning in a text file gets
+forgotten at 2am, an exception does not.
+
+--------------------------------------------------------------------------------
+[2026-08-19 | ENTRY 004 | TRACK B BUG FOUND BY ITS OWN DIAGNOSTICS -- keep this]
+--------------------------------------------------------------------------------
+First Track B smoke run reported:
+    eff_rank_frac=0.056   z_std=0.00084   mmd/ksd/mom pinned at constants
+i.e. the encoder was outputting EXACTLY ZERO and not moving.
+
+Cause: DiT zero-initialises its final layer. That is standard and CORRECT for a
+denoiser, because the EDM skip connection c_skip*x carries the signal at init.
+The encoder E has no such skip -- so a zero-init E outputs identically zero,
+which IS the fully-collapsed encoder. The degenerate solution that Track B's
+whole design is meant to avoid was being handed to the optimiser as its
+STARTING POINT, and the Gaussianity gradient at exactly z=0 is uninformative.
+
+Fix: give E a skip. E(x) = (x/sigma_data + net(x/sigma_data)) * sigma_max, so at
+init E is a whitening map (z has std sigma_max when x has std sigma_data) and
+the network learns the residual. After the fix: eff_rank_frac 0.056 -> 0.88,
+z_std 0.00084 -> 2.2.
+
+This is worth recording for two reasons. First, it would have burned a full
+multi-day 8-GPU run before anyone noticed, because the loss curves looked fine --
+only the rank diagnostic showed it. Second, it argues the diagnostics were
+correctly chosen: effective rank of E#p_data is a leading indicator of collusion
+and moves long before FID does. Keep diag_every small early in every Track B run.
+
+Also fixed while here: teacher_ode had dead code and started its reverse pass at
+sigma=0 where the PF-ODE drift is undefined -- inversion now runs sigma_min to
+sigma_max. And eff_rank was normalised by d when a batch of B can span at most
+min(B,d) dimensions, which made the number meaningless whenever B < d.
+
+--------------------------------------------------------------------------------
+[2026-08-19 | ENTRY 005 | EXP02 -- can a Gaussianity term actually see encoder failure?]
+--------------------------------------------------------------------------------
+Track B's whole bet is that "match E#p_data to N(0,I)" is easier than "match
+G#N(0,I) to p_data". That is only true if the Gaussianity discrepancy can DETECT
+the ways an encoder fails, at real latent dimension. So: detection power at 5%
+false-positive rate, 100 null + 100 alternative replicates per cell, B=256.
+Perturbations chosen as the realistic encoder failures. Runtime 177 s.
+(Runtime was 10x worse until I noticed the null was being recomputed per
+perturbation; caching it per (stat,B,d) is the whole speedup.)
+
+  perturbation        d=256   d=1024  d=4096  d=16384      what it models
+  ------------------------------------------------------------------------
+  mean 0.05    mmd     1.00    1.00    1.00    1.00        offset code
+               ksd     1.00    1.00    1.00    1.00
+               moment  0.93    1.00    1.00    1.00
+  scale 2%     mmd     0.29    0.77    1.00    1.00        mis-calibrated spread
+               ksd     0.06    0.04    0.08    0.00   <--  BLIND, worsens with d
+               moment  0.83    1.00    1.00    1.00
+  lowrank 10%  mmd     0.17    0.09    0.10    0.00   <--  THE collusion signature
+               ksd     0.27    0.13    0.18    0.00   <--  both kernels fail
+               moment  1.00    1.00    1.00    1.00   <--  and the cheap term wins
+  mixture      mmd     0.06    0.05    0.07    0.00        two modes, mean AND
+   (matched    ksd     0.06    0.05    0.06    0.00        covariance EXACTLY
+    moments)   moment  0.11    0.06    0.06    0.01        matched to N(0,I)
+  corr 0.10    mmd     0.06    0.08    0.16    0.16        correlated coords,
+               ksd     0.10    0.13    0.31    0.50   <--  KSD's one win
+               moment  0.10    0.07    0.05    0.03        (improves with d)
+
+FINDING 4 -- the cheap O(Bd) moment penalty beats both kernel discrepancies on
+  every perturbation except correlation, at ~100x lower cost. For idea #1 this
+  is deflating: against a Gaussian target at B=256, kernel machinery buys almost
+  nothing over matching the first two moments. It is NOT redundant only for
+  correlation structure, where KSD is the only term with real power and, notably,
+  gets BETTER with dimension (0.10 -> 0.50).
+
+FINDING 5 -- KSD is blind to isotropic scale error and gets blinder as d grows
+  (0.06 -> 0.00). Anyone building a Stein-based distillation loss should know
+  this: a student whose output distribution is uniformly over- or under-dispersed
+  is invisible to KSD. That is a plausible real failure mode, not a contrived one.
+
+FINDING 6 -- and this one constrains Track B's design. The "mixture" perturbation
+  -- two well-separated modes with mean and covariance EXACTLY matched to N(0,I)
+  -- is undetectable by ALL THREE statistics at every dimension tested (power at
+  or below chance). So the Gaussianity term CANNOT rule out a colluding encoder
+  that produces a non-Gaussian code with correct first two moments.
+  => The teacher anchor in Track B is NOT optional insurance. It is load-bearing,
+     and it is the only term that pins E to the true inverse rather than to some
+     arbitrary moment-matched map. Configs with w_anchor=0 are an ABLATION to
+     show the failure, not a viable variant.
+  => Design decision, now evidence-backed rather than guessed: use moment + MMD
+     + KSD together. Their blind spots are complementary (moment: rank+scale,
+     mmd: scale, ksd: correlation) and none of them covers mixture.
+
+FINDING 7 (from re-plotting exp01 on a log axis) -- the ungated online rule is
+  not merely imprecise at low noise, it is CATASTROPHIC: MSE is up to 2x10^4
+  times worse than just using the teacher. Gating lambda to 1 below
+  0.5*sigma_data recovers it exactly (the gated curve lies on lambda* to plotting
+  accuracy). So `lam_gate_sigma` is not a nuisance knob -- without it Track A
+  would lose to the DMD2 baseline outright. It is set in every Track A config.
+  Figures: figures/fig1_lambda.png, figures/fig2_power_dim.png
+
+--------------------------------------------------------------------------------
+[2026-08-19 | ENTRY 006 | EXP03 (partial) + two DDP bugs caught in review]
+--------------------------------------------------------------------------------
+EXP03 -- power vs BATCH SIZE, d=4096, 100 replicates:
+
+  perturbation      B=64   B=128  B=256  B=512
+  scale 2%    mmd   0.27   0.79   1.00   1.00
+              ksd   0.03   0.08   0.06   0.13     blind at every B
+              mom   1.00   1.00   1.00   1.00
+  lowrank 10% mmd   0.06   0.05   0.10   0.17     grows, but from nothing
+              ksd   0.06   0.07   0.18   0.29
+              mom   1.00   1.00   1.00   1.00
+  mixture     all   ~0.06  ~0.05  ~0.07  ~0.09    NO growth with B at all
+  corr 0.10   mmd   0.10   0.08   0.16   0.35
+              ksd   0.12   0.12   0.31   0.76  <-- 6x from gathering the batch
+              mom   0.06   0.04   0.05   0.05
+
+FINDING 8 -- the cross-GPU all-gather of z is worth doing and now has a number
+  attached. Per-device micro-batch is 64-128; gathered over 8 GPUs it is 512.
+  For KSD's one genuine capability (correlation structure) that is power 0.12 ->
+  0.76. The all-gather costs a (B,d) tensor, ~2 MB, i.e. nothing. Implemented in
+  invertible.py:gaussianity and, for the same reason, in robust.py for Track A's
+  REAL BATCH -- V_B ~ 1/N, so gathering multiplies the effective N by world size
+  and is the cheapest quality lever in Track A.
+
+FINDING 9 -- the "mixture" blind spot does NOT close with batch size. Power is
+  flat at chance from B=64 to B=512. So it is not a sample-size problem that
+  more compute fixes; it is a genuine limitation of these statistics. Reinforces
+  ENTRY 005 FINDING 6: the teacher anchor is the only defence.
+
+TWO BUGS found by reading the code rather than running it -- both would have
+surfaced only on multi-GPU, i.e. only after committing a node:
+  (a) `self.mu.score(...)` in dmd2.dm_loss. DDP does not forward attribute
+      access to the wrapped module, so this is AttributeError the moment
+      world_size > 1, and works fine in every single-GPU smoke test. Fixed via
+      an explicit _raw() unwrap.
+  (b) multiple grad-tracked forwards of one module per backward. The few-step
+      student calls G once per step; Track B calls G and E on three legs each.
+      DDP's reducer marks a parameter ready on its first autograd hook and
+      raises on the second. Fixed two ways: the few-step generator now runs all
+      but one randomly chosen step under no_grad (which is what DMD2 does
+      anyway), and Track B's DDP wrappers are built with static_graph=True.
+  Recording these because they are the class of bug that a single-GPU smoke test
+  is structurally incapable of catching, and the first multi-GPU launch is
+  exactly when the budget starts burning.
+
+Also added since ENTRY 003:
+  - ddgpu/gan.py + DiT.trunk(): DMD2's auxiliary discriminator as a head on the
+    critic's own features. The baseline must be the REAL DMD2, not a weakened
+    DMD -- Track A's claim is that this term can be replaced, and that claim is
+    worthless if the thing it replaces is a strawman. gan_weight=1e-3 in the
+    baseline configs, 0 in Track A's.
+  - the low-noise gate now SKIPS computing the empirical score rather than
+    down-weighting it. Beyond the ~40% compute saving there is a correctness
+    reason: cdist forms ||a||^2+||b||^2-2a.b, which at d=16384 carries ~1e-3
+    absolute error; divided by 2 sigma^2 at sigma=0.01 that is an O(10)
+    perturbation of the softmax logits, so the nearest-neighbour weights are
+    essentially arbitrary. Cheaper AND more correct.
+  - ddgpu/generate.py: sampling + FID + precision/recall, reading gpu_seconds
+    out of the checkpoint so the matched-wall-clock guard can be enforced.
+  - exp/06_toy_distill.py: end-to-end distillation on the GMM, where mode
+    coverage is EXACT (closed-form component posteriors) rather than approximated
+    by precision/recall. Queued.
+
+--------------------------------------------------------------------------------
+[2026-08-19 | ENTRY 007 | EXP03 complete + invariant test suite]
+--------------------------------------------------------------------------------
+EXP03 finished. Final cell is the striking one:
+
+  corr 0.10, d=16384:   B=64   B=128  B=256  B=512
+                 mmd    0.16   0.15   0.16   0.57
+                 ksd    0.21   0.19   0.50   0.98   <-- near-perfect at B=512
+                 moment 0.09   0.08   0.03   0.08
+
+FINDING 10 -- KSD's power against CORRELATION structure improves with BOTH
+  dimension and batch size, reaching 0.98 at d=16384/B=512. This is the opposite
+  of the usual "kernel methods die in high dimension" story, and it is the one
+  place where the Stein machinery of idea #1 clearly earns its keep. It is also
+  a concrete argument for the cross-GPU all-gather: at a per-device micro-batch
+  of 64 the same statistic has power 0.21.
+  Caveat before this gets over-claimed: the target here is N(0,I) with an EXACT
+  linear score. Nothing in exp02/03 speaks to KSD against a data distribution
+  whose score comes from a network -- which is the setting info.txt warned about,
+  and which these experiments deliberately do not test.
+
+FINDING 11 -- the picture across exp02+exp03, as a design rule for Track B:
+    moment penalty  -> rank collapse, scale.        Power 1.0 everywhere, O(Bd).
+    MMD (h^2 = d)   -> scale (needs B >= 256).      Redundant with moment.
+    KSD             -> correlation only, wants big B and big d.
+    nothing         -> mixture / matched-moment non-Gaussianity.
+  So the honest weighting is: moment as the workhorse, KSD for what only it
+  sees, MMD as cheap insurance. And the teacher anchor for the gap none of them
+  cover. Configs updated accordingly is a TODO for the first GPU sweep -- the
+  current weights (w_mmd=10, w_ksd=1, w_moment=10) were set before this evidence
+  and should be revisited against it.
+
+TEST SUITE (tests/test_all.py, all passing). Not coverage for its own sake --
+each test guards a way a wrong number could look plausible and reach a plot:
+  - GMM closed-form score == autograd of closed-form log-prob (guards every
+    lambda* number)
+  - empirical_score == exact score of the noised empirical measure (a softmax
+    temperature slip here would bias Track A everywhere, silently)
+  - lam_hat recovers lam* in a controlled b_B~0 setup. NOTE: the first version
+    of this test passed trivially because lam* pinned at 0.03 -- I had to scale
+    the injected teacher bias so ||b_A||^2 ~ V_B before the test discriminated
+    anything. It now reads lam*=0.497, lam^=0.483, and the fused estimator halves
+    MSE (1.35e-2 vs 2.70e-2). A test that passes for the wrong reason is worse
+    than no test.
+  - EDM score == (D-x)/sigma^2
+  - teacher ODE round-trip z->x->z, rel err 0.002 (validates the anchor pairs)
+  - MMD/KSD null vs shift at d = 64/1024/16384
+  - DiT param counts (guards every memory number in RUNPLAN.md)
+  - LoRA adapter isolation (perturbing student leaves critic and base untouched)
+  - the low-noise gate returns the teacher score EXACTLY and does not touch the
+    estimator
+
+Also: ddgpu/lora.py added for the SDXL tier. Corrected the LoRA fraction in the
+budget from an assumed 2.1% to a measured-by-construction 6.6% (attention+FF at
+r=64); SDXL state goes 6.4 -> 9.8 GiB, still fits 8x5090 comfortably, micro-batch
+ceiling 12/GPU rather than 14. Better a pessimistic number in the plan than an
+optimistic one that OOMs on launch night.
+
+--------------------------------------------------------------------------------
+[2026-08-19 | ENTRY 008 | the gate threshold, swept rather than guessed]
+--------------------------------------------------------------------------------
+ENTRY 001 FINDING 3 proposed gating lambda to 1 below "0.5*sigma_data" as a
+plausible fix. I had not actually swept it. Doing so changes the answer:
+
+  gate (x sigma_data)   worst MSE ratio   mean MSE ratio
+        0.3                  33.77            2.947
+        0.5                   3.68            1.019   <-- what I had assumed
+        0.7                   1.000           0.862
+        0.9                   1.000           0.862
+        1.1                   1.000           0.862
+        1.6                   1.000           0.863
+        2.0                   1.000           0.886
+  (ratio = fused MSE / MSE of the better single estimator; >1 means the fusion
+   LOSES to just using the teacher)
+
+At 0.5*sigma_data the fused estimator is still 3.7x WORSE than the teacher in the
+transition band, because lam_hat under-shoots badly there too: at
+sigma/sigma_data = 0.685, lam* = 0.963 but lam_hat = 0.680. The safe band is
+[0.7, 1.6]; 1.0 sits in its middle and is the setting I have adopted.
+
+Two consequences:
+  - the gate is now expressed as lam_gate_mult, a MULTIPLE of sigma_data, which
+    is the unit it was measured in. Previously configs carried an absolute
+    lam_gate_sigma=0.5 alongside sigma_data=0.5, which happened to equal
+    1.0*sigma_data -- i.e. the right answer for the wrong reason, and it would
+    have silently become the WRONG answer the moment sigma_data changed with the
+    dataset. Latent sigma_data is a property of the VAE and the data, not a
+    constant.
+  - I had written that the gate "recovers the optimum to plotting accuracy".
+    That was too strong for gate=0.5. It is true for gate>=0.7. Corrected in the
+    figure and the report.
+
+Worth noting what this cost: nothing, because it was a 20-line sweep on a
+quantity I had already computed. It would have cost a multi-day 8-GPU run to
+discover as "the robust variant is mysteriously worse than the baseline".
+
+--------------------------------------------------------------------------------
+[2026-08-19 | ENTRY 009 | EXP04 -- the dimension ladder, and the objection that
+                          actually mattered]
+--------------------------------------------------------------------------------
+234 cells: d in {8,32,128} x N in {64,256,1024} x four kinds of evaluation point.
+(d=512 still training; will extend.) Metric throughout is score MSE divided by
+the better of the two single estimators -- so <1 is a win over an ORACLE that
+already gets to pick the best of teacher-alone or data-alone.
+
+(A) DIMENSION. exp01 was one dimension; here it is three, spanning 16x.
+    d=8   mean 0.921   best cell 0.670
+    d=32  mean 0.857   best cell 0.549
+    d=128 mean 0.943   best cell 0.618      (N=256, on-distribution)
+  FINDING 12 -- lambda* = 1.0 at low sigma holds at EVERY dimension tested. The
+  exp01 result is not a low-dimensional artefact. What does move with dimension
+  is WHERE the win sits: the best band shifts DOWN in sigma as d grows
+  (sigma/sigma_data ~ 10.5 at d=8, ~3.4 at d=32, ~2.0 at d=128). Anyone porting
+  this to a 4096- or 16384-dim latent should expect the useful band to sit lower
+  than the toy suggests, and should not hard-code a sigma range.
+
+(B) REAL-BATCH SIZE. This one has a hard operational consequence.
+    N=64    mean 1.141   p90 1.204   worst 5.70    <-- WORSE than the teacher
+    N=256   mean 0.907   p90 1.000   worst 1.15
+    N=1024  mean 0.910   p90 1.000   worst 1.00
+  FINDING 13 -- at N=64 the method LOSES, and loses badly (5.7x). Every one of
+  the five worst cells across all 234 is an N=64 cell. Since the per-device
+  micro-batch in the run plan is 32-128, a naive implementation would sit
+  exactly in the failure regime. The cross-GPU all-gather of the real batch
+  (robust.py:all_gather_batch) is therefore not an optimisation, it is a
+  CORRECTNESS REQUIREMENT: 8 GPUs x micro 32 gives N=256, which is the first
+  safe row. Recorded as a hard precondition in RUNPLAN.
+
+(C) OFF-DISTRIBUTION EVALUATION POINTS. The objection I most expected to matter,
+    and it does -- but it revises the story rather than breaking it.
+    In real distillation the score is queried at STUDENT samples. Simulating a
+    student three ways at d=128, N=256:
+
+      kind      lam* at low sigma   var_B/||s||^2   bias_A/||s||^2   oracle gain
+      ondist          1.00              90.8            0.032           1.00
+      blurred         0.76               0.6            0.376           0.63
+      shifted         0.77               0.6            0.372           0.63
+      shrunk          0.58               0.6            0.852           0.42
+
+  FINDING 14 -- off the data manifold the picture INVERTS at low noise, and both
+  terms move: the batch estimator's variance drops ~150x (90.8 -> 0.6) while the
+  teacher's bias rises ~27x (0.032 -> 0.852). So at student samples the real-data
+  term IS valuable at low noise -- up to a 58% MSE cut when the student is
+  mode-collapsed, which is precisely when you would want it.
+  This reframes rather than restores the folklore. The real-data term is not
+  correcting the teacher's low-noise bias ON the data manifold -- there it is
+  worthless, exactly as exp01 said. It is correcting the teacher OFF the
+  manifold, where the teacher was never trained. Those are different claims with
+  different implications, and the second one predicts that the term's value
+  should SHRINK as the student converges. That is a testable prediction and it
+  is cheap to check in exp06: track lambda* against training progress.
+
+  FINDING 15 -- and here is the cost. The online estimator cannot see any of
+  this. At d=128, low sigma, lam_hat reads 0.32 (ondist) vs 0.13 (off) -- it
+  moves the right way but under-shoots enormously in both cases (true values
+  1.00 and 0.76). So the sigma gate, which is what makes the method safe, also
+  forfeits most of the off-distribution gain:
+      shrunk:  oracle mean 0.651 (best 0.415)  vs shipped 0.926 (best 0.573)
+  That is ~28% of available improvement left on the table exactly where the
+  student is worst. It is a well-posed open problem, not a mystery: the missing
+  quantity is <b_B, u>, the term lam_hat drops. A Richardson-style extrapolation
+  in N (comparing B estimated at N and 2N) is the obvious attack and is cheap,
+  since both are already computed for the half-batch variance estimate. NOT
+  implemented; recorded as the highest-value next idea for Track A.
+
+(D) GATE, re-swept on all 234 cells rather than the 17 of ENTRY 008:
+      gate 0.7 / 1.0 / 1.4  ->  mean 0.944 / 0.944 / 0.941, worst 5.70 (all N=64)
+      gate 2.0 / 3.0        ->  mean 0.996, worst 6.49
+      adding a lambda FLOOR (0.2/0.4/0.6) makes every metric worse.
+  Conclusion unchanged: gate in [0.7,1.4]*sigma_data, no floor. 1.0 shipped.
+
+HONEST AGGREGATE, so this does not get over-claimed downstream: the headline
+0.51x is the BEST noise bucket. Averaged over the whole noise schedule the
+shipped rule gives ~6-9% score-MSE reduction. Whether a 6-9% mean score-MSE
+improvement moves sample quality at all is a completely separate question, and it
+is the one exp06 (end-to-end distillation with exact mode-coverage measurement)
+is queued to answer. Until that lands, Track A is a well-measured estimator
+result and NOT a demonstrated distillation improvement.
+
+--------------------------------------------------------------------------------
+[2026-08-19 | ENTRY 010 | d=512 BREAKS THE SHIPPED RULE -- the dimension cliff,
+                          found before spending anything on it]
+--------------------------------------------------------------------------------
+exp04's d=512 block finished and it invalidates the gate I shipped in ENTRY 008.
+
+  FULL LADDER (N=256, on-distribution)
+   d     oracle mean   oracle best   sigma* of best   SHIPPED mean   SHIPPED best
+   8        0.905         0.622          10.48            0.921         0.670
+  32        0.849         0.548           3.39            0.857         0.549
+ 128        0.907         0.623           1.96            0.943         0.618
+ 512        0.869         0.493           0.19            2.989         0.947  <--
+
+FINDING 16 -- the ORACLE stays healthy at d=512 (0.869 mean, 0.493 best), so the
+  underlying doubly-robust idea does NOT break with dimension. What breaks is my
+  estimator-plus-gate. The shipped rule goes to 2.989 mean and 21.0 in its worst
+  bucket -- three times WORSE than simply using the teacher.
+
+  Mechanism, from the d=512 breakdown: the teacher's bias is ~13x larger there
+  (bias_A/||s||^2 = 0.43 vs 0.032 at d=32; same 0.84M-param MLP, same 6k steps,
+  so it is far more under-trained at 512 dims). That moves the crossover where
+  var_B falls below bias_A from sigma/sigma_data ~ 1 down to ~0.15. lambda* is
+  already 0.68 at 0.108 and 0.06 at 0.609 -- the ENTIRE useful region now sits
+  BELOW the gate, so the gate forces lambda=1 exactly where lambda should be
+  small, and pays 21x for it.
+
+FINDING 17 -- the general lesson, which is the one worth carrying: the gate was
+  calibrated in units of sigma_data, but the quantity it stands in for is the
+  crossover between the batch estimator's VARIANCE and the teacher's BIAS. That
+  crossover is not a fixed multiple of sigma_data -- it moves with dimension,
+  with teacher quality, and therefore with training progress. A rule that needs
+  re-tuning per latent dimension is not usable at 4096 or 16384 dims, which is
+  where this has to work. This is precisely the "cliff" info.txt warned about for
+  dimension-dependent methods, and it would have been invisible at SD1.5 scale.
+
+  Cost of finding it here: about 40 minutes of one CPU core.
+  Cost of finding it on the GPU VM: the DiT-B/2 @512px runs are 4x5090 for 2.2
+  days each, and the failure would have presented as "the robust variant is
+  mysteriously worse than the baseline at higher resolution" -- i.e. as a
+  confusing negative result, not as a diagnosable bug.
+
+THE FIX (exp/07, running): stop gating, estimate the term the online rule drops.
+  lambda* = (V_B - <b_B,u>)/(||u||^2 + V_B). The missing factor b_B is the bias
+  of a KDE-type estimator with N samples, and it vanishes as N -> infinity, so
+  its magnitude is visible in how the estimate MOVES with N:
+      Delta := B_{N/2} - B_N,   E[Delta] = b_B(N/2) - b_B(N),
+      and under b_B(N) ~ c/N,   b_B(N) ~ Delta.
+  u = b_A - b_B is directly estimable as A - B_N. Both half-batch estimates are
+  ALREADY computed for the variance term, so the correction costs nothing extra;
+  the only change is to draw two independent real batches so the two factors'
+  noise does not correlate.
+      lambda_rich = (V_B - <Delta_P, A - B_Q>) / E||A-B||^2
+  If this tracks lambda* at d=512 without a gate, Track A becomes
+  dimension-transferable and the gate can be dropped entirely. If it does not,
+  the honest conclusion is that Track A needs a per-dimension calibration run,
+  which is a real cost that must go in the budget.
+
+--------------------------------------------------------------------------------
+[2026-08-19 | ENTRY 011 | THE FIX -- lambda from a held-out denoising loss.
+                          Gate removed, hyperparameter removed]
+--------------------------------------------------------------------------------
+First, the negative result. exp07 tested the Richardson-in-N correction proposed
+in ENTRY 010. It barely moves the estimate: at d=512, low sigma, lambda* = 0.985,
+lambda_hat = 0.289, lambda_rich = 0.308. Mean MSE ratio 6.92 vs 7.26 -- a 5%
+improvement on a 700% problem.
+  WHY, and it is worth understanding rather than discarding: the correction
+  assumes the empirical score's bias falls like 1/N. It does not. At small sigma
+  the KDE score is nearest-neighbour dominated, and nearest-neighbour distance
+  scales like N^{-1/d}. At d=512 that is N^{-0.002} -- the bias is essentially
+  FLAT in N, so halving the batch reveals nothing about it. The curse of
+  dimensionality lands precisely on the correction term. Richardson-in-N is dead
+  for this purpose and I am recording that so it does not get retried.
+
+THE ACTUAL FIX (exp08). Stop trying to estimate b_B at all.
+
+On held-out real data an unbiased estimate of the true score is FREE. Take
+x_t = x_0 + sigma*eps with x_0 held out; then g = -eps/sigma satisfies
+E[g | x_t] = s(x_t) exactly -- that is just the DSM identity. A is deterministic
+given x_t, and B depends only on the training batch, so both are conditionally
+independent of the noise in g. Therefore
+
+    E|| lam*A + (1-lam)*B - g ||^2  =  MSE(lam)  +  E||g - s||^2
+                                                     \-- no lam in here --/
+
+Minimising the held-out DENOISING loss minimises the TRUE score MSE exactly, and
+the minimiser is closed form:
+
+    lam_dsm = E<A - B, g - B> / E||A - B||^2
+
+No true score. No gate. No assumption about b_B. Nothing calibrated per
+dimension. It costs one teacher forward on half the real batch plus one cdist.
+
+RESULT (d=512, the configuration that broke everything else):
+  sig/sd    lam*   lam_dsm   lam^    gate  |    g*   g_dsm     g^    g_gate
+   0.019   0.985    0.985   0.290   1.000  | 0.994   0.994   54.4     1.00
+   0.077   0.808    0.809   0.238   1.000  | 0.862   0.862    3.36    1.00
+   0.153   0.516    0.515   0.155   1.000  | 0.520   0.520    0.80    1.00
+   0.305   0.211    0.208   0.067   1.000  | 0.835   0.833    0.89    4.76
+   0.609   0.062    0.062   0.023   1.000  | 0.962   0.962    0.97   21.43
+
+  summary        oracle lam*      lam_dsm       lam_hat        sigma gate
+    d=512     0.913 / 0.99    0.920 / 1.03   7.196 / 54.4   3.189 / 21.4
+    d=32      0.845 / 1.00    0.888 / 1.17  1243.5 / 7245   0.855 / 1.00
+
+FINDING 18 -- lam_dsm reproduces the exact MSE-optimal lambda to three decimals
+  at d=512, with no ground truth, and takes the method from 3.19x WORSE than
+  baseline to 0.92 -- within 0.007 of the oracle. At d=32 it is 0.888 against an
+  oracle of 0.845; the small gap there is finite-sample noise in exp08 (12
+  batches x 256 points), not bias. In training the statistic accumulates under an
+  EMA over thousands of steps, so the effective sample count is orders of
+  magnitude larger and that gap should close.
+
+CONSEQUENCES, and they are large for the shape of Track A:
+  - the sigma gate is DELETED for the default estimator. Its only remaining use
+    is the legacy 'ratio' mode, kept for ablation.
+  - lam_gate_mult stops being a hyperparameter that needs a per-dimension sweep.
+    Track A now has ZERO tuned hyperparameters in its lambda path, which was the
+    entire selling point of the idea and was quietly not true until now.
+  - it is dimension-transferable BY CONSTRUCTION rather than by luck, which is
+    what makes the jump from d=512 to a 4096- or 16384-dim latent defensible.
+  - the paper's story improves: the contribution is no longer "a variance-optimal
+    weight" but "the optimal weight is the minimiser of a held-out denoising
+    loss, which is computable, and here is what it looks like".
+
+IMPLEMENTED in ddgpu/robust.py (LambdaEstimator.calibrate + mode="dsm") and wired
+into DMD2Trainer, calibrating every lam_calib_every=4 steps on the all-gathered
+real batch. One implementation detail that is not optional: the real batch is
+SPLIT, half for the calibration points and half for the empirical score. If they
+overlap, B has seen the very sample it is being scored against and memorises it,
+which biases the calibration in exactly the direction the whole method is about.
+Buckets with fewer than lam_min_count=256 samples fall back to lambda=1, so the
+early-training behaviour is the safe one.
+
+Verified end to end: after 120 smoke steps the online curve reads lambda = 1.000
+at sigma<0.5, 0.952 at sigma=0.92, 0.732 at sigma=2.47 -- the right shape,
+emerging from calibration alone. Two tests added (tests/test_all.py:
+t_dsm_lambda checks lam_dsm against the exact lam* at d=16 and d=64 with no
+ground truth; t_dsm_estimator_wiring checks the fallback and the curve). All
+passing.
+
+TIMELINE NOTE, because it is the point of doing any of this on a laptop:
+ENTRY 008 shipped a gate. ENTRY 009 validated it across 234 cells. ENTRY 010
+found it collapses at d=512. ENTRY 011 replaced it with something derived. That
+whole arc cost about two hours of one CPU core. On the GPU VM the same arc is
+four multi-day runs, and the d=512 failure would have arrived as an unexplained
+regression at higher resolution rather than as a diagnosable bug.

@@ -1,0 +1,77 @@
+
+=== mode=teacher seed=0 d=32 ===
+    it   500 ld    0.261 lg   0.16674 lam 1.000
+    it  1000 ld    0.254 lg   0.10239 lam 1.000
+    it  1500 ld    0.272 lg   0.12964 lam 1.000
+    it  2000 ld    0.259 lg   0.09982 lam 1.000
+    it  2500 ld    0.235 lg   0.08773 lam 1.000
+    it  3000 ld    0.231 lg   0.09222 lam 1.000
+    {'energy_dist': 3.8751, 'logp': 7.1463, 'logp_real': 47.6428, 'mode_kl': 22.0977, 'precision': 0.8605, 'recall': 0.1055, 'std_ratio': 0.8025, 'mode': 'teacher', 'seed': 0, 'd': 32, 'steps': 3000, 'secs': 206.0}
+
+=== mode=teacher seed=1 d=32 ===
+    it   500 ld    0.288 lg   0.12763 lam 1.000
+    it  1000 ld    0.287 lg   0.10343 lam 1.000
+    it  1500 ld    0.255 lg   0.14067 lam 1.000
+    it  2000 ld    0.267 lg   0.11103 lam 1.000
+    it  2500 ld    0.236 lg   0.08049 lam 1.000
+    it  3000 ld    0.235 lg   0.08601 lam 1.000
+    {'energy_dist': 4.1721, 'logp': 17.9715, 'logp_real': 47.6428, 'mode_kl': 22.0977, 'precision': 0.917, 'recall': 0.0825, 'std_ratio': 0.7934, 'mode': 'teacher', 'seed': 1, 'd': 32, 'steps': 3000, 'secs': 291.1}
+
+=== mode=robust seed=0 d=32 ===
+    it   500 ld    0.313 lg   0.15377 lam 0.884
+    it  1000 ld    0.294 lg   0.11290 lam 0.881
+    it  1500 ld    0.269 lg   0.10635 lam 0.889
+    it  2000 ld    0.245 lg   0.11296 lam 0.895
+    it  2500 ld    0.251 lg   0.10765 lam 0.893
+    it  3000 ld    0.242 lg   0.08680 lam 0.877
+    {'energy_dist': 4.2011, 'logp': 34.9461, 'logp_real': 47.6428, 'mode_kl': 22.0977, 'precision': 0.905, 'recall': 0.0975, 'std_ratio': 0.812, 'mode': 'robust', 'seed': 0, 'd': 32, 'steps': 3000, 'secs': 192.8}
+
+=== mode=robust seed=1 d=32 ===
+    it   500 ld    0.243 lg   0.15269 lam 0.864
+    it  1000 ld    0.254 lg   0.13160 lam 0.885
+    it  1500 ld    0.329 lg   0.11070 lam 0.872
+    it  2000 ld    0.262 lg   0.10890 lam 0.878
+    it  2500 ld    0.251 lg   0.09651 lam 0.899
+    it  3000 ld    0.250 lg   0.11433 lam 0.883
+    {'energy_dist': 4.2028, 'logp': 23.2313, 'logp_real': 47.6428, 'mode_kl': 22.0977, 'precision': 0.8985, 'recall': 0.101, 'std_ratio': 0.8321, 'mode': 'robust', 'seed': 1, 'd': 32, 'steps': 3000, 'secs': 193.2}
+
+=== mode=fixed seed=0 d=32 ===
+    it   500 ld    0.313 lg   0.14372 lam 0.859
+    it  1000 ld    0.291 lg   0.13392 lam 0.828
+    it  1500 ld    0.270 lg   0.10994 lam 0.844
+    it  2000 ld    0.247 lg   0.11147 lam 0.852
+    it  2500 ld    0.240 lg   0.09598 lam 0.854
+    it  3000 ld    0.239 lg   0.09319 lam 0.832
+    {'energy_dist': 4.1973, 'logp': 35.3794, 'logp_real': 47.6428, 'mode_kl': 22.0977, 'precision': 0.924, 'recall': 0.0975, 'std_ratio': 0.8081, 'mode': 'fixed', 'seed': 0, 'd': 32, 'steps': 3000, 'secs': 195.6}
+
+=== mode=fixed seed=1 d=32 ===
+    it   500 ld    0.249 lg   0.15650 lam 0.832
+    it  1000 ld    0.253 lg   0.12257 lam 0.838
+    it  1500 ld    0.297 lg   0.12391 lam 0.816
+    it  2000 ld    0.251 lg   0.11376 lam 0.830
+    it  2500 ld    0.256 lg   0.12797 lam 0.857
+    it  3000 ld    0.261 lg   0.11209 lam 0.834
+    {'energy_dist': 4.0056, 'logp': 36.5351, 'logp_real': 47.6428, 'mode_kl': 22.0977, 'precision': 0.836, 'recall': 0.1025, 'std_ratio': 0.8407, 'mode': 'fixed', 'seed': 1, 'd': 32, 'steps': 3000, 'secs': 180.8}
+
+=== mode=data seed=0 d=32 ===
+    it   500 ld    0.309 lg   0.18186 lam 0.719
+    it  1000 ld    0.297 lg   0.17340 lam 0.656
+    it  1500 ld    0.280 lg   0.13515 lam 0.688
+    it  2000 ld    0.245 lg   0.12476 lam 0.703
+    it  2500 ld    0.250 lg   0.14609 lam 0.707
+    it  3000 ld    0.246 lg   0.12084 lam 0.664
+    {'energy_dist': 4.1941, 'logp': 31.134, 'logp_real': 47.6428, 'mode_kl': 22.0977, 'precision': 0.9065, 'recall': 0.095, 'std_ratio': 0.7994, 'mode': 'data', 'seed': 0, 'd': 32, 'steps': 3000, 'secs': 179.8}
+
+=== mode=data seed=1 d=32 ===
+    it   500 ld    0.247 lg   0.21649 lam 0.664
+    it  1000 ld    0.257 lg   0.15258 lam 0.676
+    it  1500 ld    0.311 lg   0.15848 lam 0.633
+    it  2000 ld    0.253 lg   0.15177 lam 0.660
+    it  2500 ld    0.255 lg   0.14590 lam 0.715
+    it  3000 ld    0.246 lg   0.14434 lam 0.668
+    {'energy_dist': 4.0919, 'logp': 33.092, 'logp_real': 47.6428, 'mode_kl': 22.0977, 'precision': 0.86, 'recall': 0.095, 'std_ratio': 0.8359, 'mode': 'data', 'seed': 1, 'd': 32, 'steps': 3000, 'secs': 187.3}
+
+=== reference: teacher's own few-step samples ===
+    {'mode': 'teacher_heun1', 'd': 32, 'energy_dist': 9.6441, 'logp': -469950.5625, 'logp_real': 47.6428, 'mode_kl': 13.3858, 'precision': 0.0, 'recall': 1.0, 'std_ratio': 4.3086}
+    {'mode': 'teacher_heun8', 'd': 32, 'energy_dist': 0.0324, 'logp': -97.9177, 'logp_real': 47.6428, 'mode_kl': 0.0008, 'precision': 0.4845, 'recall': 0.9835, 'std_ratio': 1.0769}
+    {'mode': 'teacher_heun32', 'd': 32, 'energy_dist': 0.007, 'logp': 12.5496, 'logp_real': 47.6428, 'mode_kl': 0.0006, 'precision': 0.8715, 'recall': 0.8585, 'std_ratio': 0.9999}
