@@ -460,6 +460,16 @@ co-scheduled with 4-GPU jobs on the same node — but see the co-location warnin
   in §1 comes from a synthetic teacher with a controllable bias profile. §5's
   "the synthetic teacher may be unrealistically good at low σ" is now testable
   cheaply: Run 1 emits the real λ(σ) curve within its first checkpoint interval.
+- **The λ calibration leg sees N/2, not N.** `LambdaEstimator.calibrate` splits
+  the gathered real batch — half supplies calibration points, half supplies `B` —
+  and that split is not optional (overlap makes `B` memorise the sample it is
+  scored against). But it means the calibration estimates the optimal weight for
+  an empirical score built from **half** the samples the training-time fusion
+  actually uses, which biases λ *toward the teacher*. Conservative rather than
+  dangerous, and it shrinks as N grows. To clear §1.4's floor on **both** legs the
+  effective real batch wants to be 512, i.e. micro_batch 64 on 8 GPUs. The
+  launcher warns when it is not. Not measured; worth one cell of exp04 if the
+  first real λ curve looks flatter than the synthetic one.
 - **The drift probe is a lower bound, not λ\*.** `LambdaProbe` uses the ratio
   statistic, which drops the ⟨b_B, u⟩ term and is loosest at small σ. Read the
   *difference* between the real and student legs, never the levels. The CPU smoke
