@@ -1,0 +1,507 @@
+root@autodl-container-5e96488cf6-57f363db:~/autodl-tmp/diffusion-distill#  scripts/smoke.sh --gpu
+[dd] 1/4  invariant tests
+
+t_gmm_score:
+  PASS  GMM score == d/dx log_prob (sigma=0.05)   [rel err 6.0e-08]
+  PASS  GMM score == d/dx log_prob (sigma=0.5)   [rel err 6.0e-08]
+  PASS  GMM score == d/dx log_prob (sigma=5.0)   [rel err 1.1e-06]
+
+t_empirical_score:
+  PASS  empirical_score == exact KDE score (sigma=0.3)   [rel err 9.3e-07]
+  PASS  empirical_score == exact KDE score (sigma=1.0)   [rel err 1.7e-07]
+  PASS  empirical_score == exact KDE score (sigma=3.0)   [rel err 2.0e-07]
+
+t_lambda_recovers_known:
+  PASS  lam* is interior (test is discriminating)   [lam*=0.497]
+  PASS  lam_hat tracks lam* when b_B is small   [lam*=0.497 lam^=0.483]
+  PASS  fused MSE <= both single estimators   [1.353e-02 vs 2.700e-02]
+
+t_dsm_lambda:
+  PASS  lam_dsm recovers lam* with NO ground truth (d=16)   [lam*=0.133 lam_dsm=0.146]
+  PASS  lam_dsm recovers lam* with NO ground truth (d=64)   [lam*=0.223 lam_dsm=0.235]
+
+t_dsm_estimator_wiring:
+  PASS  uncalibrated bucket falls back to lambda=1
+  PASS  calibration fills buckets   [total 160]
+  PASS  calibrated lambda stays in [0,1]
+
+t_edm_score:
+  PASS  EDM score == (D-x)/sigma^2   [max abs 0.0e+00]
+
+t_ode_roundtrip:
+  PASS  teacher ODE round-trip z -> x -> z   [rel err 0.002]
+
+t_gauss_disc:
+  PASS  MMD null~0 << shift (d=64)   [1.83e-04 vs 7.50e-03]
+  PASS  KSD null~0 << shift (d=64)   [1.46e-02 vs 4.98e-01]
+  PASS  MMD null~0 << shift (d=1024)   [2.01e-05 vs 7.91e-03]
+  PASS  KSD null~0 << shift (d=1024)   [2.25e-02 vs 8.16e+00]
+  PASS  MMD null~0 << shift (d=16384)   [-8.20e-06 vs 8.24e-03]
+  PASS  KSD null~0 << shift (d=16384)   [-1.35e-01 vs 1.36e+02]
+
+t_dit_params:
+  PASS  DiT-S/2 params == 32.86M   [got 32.86M]
+  PASS  DiT-B/2 params == 130.3M   [got 130.30M]
+  PASS  DiT-L/2 params == 457.82M   [got 457.82M]
+  PASS  DiT-XL/2 params == 674.82M   [got 674.82M]
+
+t_lora_isolation:
+  PASS  LoRA: base unaffected by adapter edit
+  PASS  LoRA: sibling adapter unaffected
+  PASS  LoRA: edited adapter did change output
+
+t_gate_skips:
+  PASS  below gate: score == teacher exactly
+  PASS  below gate: lambda == 1
+  PASS  below gate: estimator untouched
+
+============================================================
+ALL PASS
+[dd] 2/5  pipeline tests (VP preconditioning, checkpoint remap, config wiring)
+
+== t_pos_embed_matches_official ==
+  PASS  pos_embed == official (hidden=1152, grid=16)   [max|err| 0.0e+00]
+  PASS  pos_embed == official (hidden=1152, grid=32)   [max|err| 0.0e+00]
+  PASS  pos_embed == official (hidden=768, grid=16)   [max|err| 0.0e+00]
+
+== t_vp_schedule_roundtrip ==
+  PASS  sigma_max == schedule top (not EDM's 80)   [157.407]
+  PASS  t -> sigma -> t round trip   [max|dt| 4.32e-06]
+  PASS  sigma(t) strictly increasing
+  PASS  sigma below the schedule clamps to t=0
+
+== t_vp_precond_exact_on_gaussian ==
+  PASS  VP score == analytic (sigma=0.02)   [rel 7.36e-08]
+  PASS  VP score == analytic (sigma=0.3)   [rel 1.36e-07]
+  PASS  VP score == analytic (sigma=1.0)   [rel 5.78e-08]
+  PASS  VP score == analytic (sigma=7.0)   [rel 8.32e-08]
+  PASS  VP score == analytic (sigma=100.0)   [rel 8.34e-08]
+  PASS  D == x + sigma^2 * score   [max|err| 2.38e-07]
+
+== t_student_grid ==
+  PASS  4-step student grid == DMD2 timesteps
+  PASS  student grid ends at sigma=0
+  PASS  1-step student grid starts at sigma_max
+
+== t_sigma_sampler ==
+  PASS  vp_uniform_t stays inside the schedule window   [[0.0794, 128.86]]
+  PASS  lognormal sampler still works
+
+== t_checkpoint_remap ==
+  PASS  remap: no missing keys   [[]]
+  PASS  remap: no unexpected keys   [[]]
+  PASS  remap: learn_sigma inferred
+  PASS  remap: latent_size inferred
+  PASS  remap: forward is bit-exact   [max|err| 0.0e+00]
+  PASS  remap: bad pos_embed is rejected
+
+== t_dataset_moments ==
+  PASS  moments: shape is (4,H,W) after sampling
+  PASS  moments: two reads of the same index differ (resampled)
+  PASS  moments: label preserved
+  PASS  build_dataset propagates sigma_data from meta.json
+
+== t_config_delta ==
+  PASS  robust differs from dmd2 in exactly the documented keys   [got ['gan_weight', 'lam_bins', 'lam_calib_every', 'lam_ema', 'lam_estimator', 'lam_gate_mult', 'lam_min_count', 'mode']]
+  PASS  robust turns the hand-tuned GAN term OFF
+  PASS  dmd2 carries no lambda estimator
+
+== t_ema ==
+  PASS  EMA moves halfway at decay=0.5   [0.5000]
+
+== t_lambda_probe ==
+  PASS  probe: lambda in [0,1] where sampled   [[0.4061283767223358, 0.417489618062973, 0.24060790240764618]]
+  PASS  probe: unsampled buckets are NaN, not 0
+  PASS  probe: reset clears the accumulator
+
+ALL PASS
+[dd] 3/5  teacher-zoo tests (interpolant math, DSM identity, mis-wrap detection)
+
+== t_interpolant_map ==
+  PASS  t(sigma) == REPA's sigma/(1+sigma)   [max|err| 0.00e+00]
+  PASS  sigma -> t -> sigma round trip   [max rel 3.05e-07]
+
+== t_interpolant_exact_on_gaussian ==
+  PASS  interpolant score == analytic (sigma=0.02)   [rel 1.01e-06]
+  PASS  interpolant score == analytic (sigma=0.3)   [rel 7.50e-08]
+  PASS  interpolant score == analytic (sigma=1.0)   [rel 4.72e-08]
+  PASS  interpolant score == analytic (sigma=7.0)   [rel 5.46e-08]
+  PASS  interpolant score == analytic (sigma=50.0)   [rel 4.34e-08]
+  PASS  D -> x as sigma -> 0
+  PASS  D -> E[x0] = 0 as sigma -> inf
+
+== t_student_grid_signature ==
+  PASS  VPSchedule.student_sigmas(4, sigma_max=) -> 5 values
+  PASS  VPSchedule grid starts at ~sigma_max   [157.40]
+  PASS  VPSchedule grid ends at 0
+  PASS  VPSchedule grid is decreasing
+  PASS  LinearInterpolant.student_sigmas(4, sigma_max=) -> 5 values
+  PASS  LinearInterpolant grid starts at ~sigma_max   [49.00]
+  PASS  LinearInterpolant grid ends at 0
+  PASS  LinearInterpolant grid is decreasing
+
+== t_gaussian_teacher ==
+  PASS  synthetic teacher dims   [256]
+  PASS  unbiased GaussianTeacher == true score   [0.00e+00]
+  PASS  bias scales the score as declared   [1.2500]
+
+== t_validate_teacher_catches_miswrapping ==
+  PASS  correct wrapper -> OK   [{"rel_mse@0.01": 0.00039930984174682636, "rel_mse@0.1": 0.03860127200743861, "rel_mse@0.5"]
+  PASS  x1000 noise-scale bug -> SUSPECT   [identity_err=0.64]
+
+== t_teacher_spec_errors ==
+  PASS  rejects no family prefix
+  PASS  rejects unknown family
+
+== t_dsm_identity ==
+  PASS  argmin(held-out DSM loss) == argmin(true MSE) at sigma=0.4   [dsm 1.000 vs true 1.000]
+  PASS  argmin(held-out DSM loss) == argmin(true MSE) at sigma=1.5   [dsm 0.100 vs true 0.100]
+
+== t_offline_matches_online ==
+  PASS  offline lambda == LambdaEstimator.calibrate   [0.818498 vs 0.818498]
+
+== t_pixel_dataset ==
+  PASS  pixels: shape
+  PASS  pixels: served in [-1,1]
+  PASS  pixels: lossless round trip
+  PASS  build_dataset dispatches to pixels   [{'sigma_data': 0.5, 'shape': [3, 8, 8], 'n_classes': 10, 'space': 'pixel', 'latent_size': 8}]
+
+== t_gaussian_data ==
+  PASS  gaussian data has the declared sd   [0.4994]
+  PASS  gaussian meta carries sigma_data
+
+== t_conv_gan_head ==
+  PASS  ConvGANHead -> (B,) logit   [(4,)]
+  PASS  hinge/NS losses are finite
+
+ALL PASS
+[dd] 4/5  Track A smoke (8 steps, synthetic latents, CPU)
+TEACHER-CHECK {"rel_mse@0.01": 7.5742750860635e-05, "rel_mse@0.1": 0.008540368470671732, "rel_mse@0.5": 0.2993122455437627, "rel_mse@2": 0.9002337652545528, "rel_mse@20": 0.9989090474918394, "rel_mse@100": 0.9999290993339026, "identity_err": 1.6429375217747583e-11, "mean_err": 0.035077578757548605, "monotone": true, "verdict": "OK"}
+{
+ "seed": 0,
+ "arch": "DiT-T/2",
+ "latent_size": 8,
+ "shape": [
+  4,
+  8,
+  8
+ ],
+ "n_classes": 10,
+ "sigma_data": 0.5,
+ "sigma_max": 80.0,
+ "P_mean": -1.2,
+ "P_std": 1.2,
+ "micro_batch": 16,
+ "steps": 8,
+ "lr_g": 1e-05,
+ "lr_d": 1e-05,
+ "clip": 1.0,
+ "n_student_steps": 1,
+ "cfg_scale": 1.75,
+ "d_steps": 1,
+ "log_every": 1,
+ "diag_every": 100,
+ "ckpt_every": 1000,
+ "workers": 0,
+ "amp": false,
+ "data": "synthetic",
+ "teacher_ckpt": null,
+ "init_from_teacher": true,
+ "out": "runs/smokeA",
+ "track": "A",
+ "mode": "robust",
+ "n_synth": 512,
+ "lam_gate_mult": 1.0,
+ "lam_estimator": "dsm",
+ "lam_calib_every": 4,
+ "lam_min_count": 256,
+ "lam_ema": 0.999,
+ "probe_every": 4,
+ "ema_decay": 0.99
+}
+loss_d=0.6253 loss_g=4.676e-07 lam=1 sigma=0.7258 it=1 s_per_it=0.472 gpu_hours=0.0001311
+loss_d=0.5032 loss_g=1.773e-07 lam=1 sigma=0.5345 it=2 s_per_it=0.2587 gpu_hours=0.0001437
+loss_d=0.6313 loss_g=3.81e-07 lam=1 sigma=0.5362 it=3 s_per_it=0.1848 gpu_hours=0.000154
+loss_d=0.5979 loss_g=5.983e-06 lam=1 sigma=1.375 it=4 s_per_it=0.1478 gpu_hours=0.0001643
+PROBE real:lam@med=1.000 student:lam@med=0.608
+loss_d=0.5746 loss_g=2.704e-06 lam=1 sigma=0.9742 it=5 s_per_it=0.1359 gpu_hours=0.0001888
+loss_d=0.575 loss_g=2.083e-06 lam=1 sigma=0.7638 it=6 s_per_it=0.1188 gpu_hours=0.0001981
+loss_d=0.5836 loss_g=5.499e-07 lam=1 sigma=0.3362 it=7 s_per_it=0.1068 gpu_hours=0.0002077
+loss_d=0.7673 loss_g=6.206e-07 lam=1 sigma=0.2656 it=8 s_per_it=0.09796 gpu_hours=0.0002177
+PROBE real:lam@med=1.000 student:lam@med=0.521
+done 0.8440759181976318
+[dd]      Track B smoke (8 steps, synthetic latents, CPU)
+TEACHER-CHECK {"rel_mse@0.01": 7.5742750860635e-05, "rel_mse@0.1": 0.008540368470671732, "rel_mse@0.5": 0.2993122455437627, "rel_mse@2": 0.9002337652545528, "rel_mse@20": 0.9989090474918394, "rel_mse@100": 0.9999290993339026, "identity_err": 1.6429375217747583e-11, "mean_err": 0.035077578757548605, "monotone": true, "verdict": "OK"}
+{
+ "seed": 0,
+ "arch": "DiT-T/2",
+ "latent_size": 8,
+ "shape": [
+  4,
+  8,
+  8
+ ],
+ "n_classes": 10,
+ "sigma_data": 0.5,
+ "sigma_max": 80.0,
+ "P_mean": -1.2,
+ "P_std": 1.2,
+ "micro_batch": 16,
+ "steps": 8,
+ "lr_g": 2e-05,
+ "lr_d": 1e-05,
+ "clip": 1.0,
+ "n_student_steps": 1,
+ "cfg_scale": 1.75,
+ "d_steps": 1,
+ "log_every": 1,
+ "diag_every": 3,
+ "ckpt_every": 1000,
+ "workers": 0,
+ "amp": false,
+ "data": "synthetic",
+ "teacher_ckpt": null,
+ "init_from_teacher": true,
+ "out": "runs/smokeB",
+ "track": "B",
+ "w_rec": 1.0,
+ "w_cyc": 1.0,
+ "w_mmd": 10.0,
+ "w_ksd": 1.0,
+ "w_moment": 10.0,
+ "w_anchor": 1.0,
+ "anchor_batch": 16,
+ "n_anchors": 32,
+ "anchor_steps": 4,
+ "anchor_path": null,
+ "n_synth": 512,
+ "probe_every": 0,
+ "ema_decay": 0.99
+}
+building teacher anchor cache ...
+/root/autodl-tmp/diffusion-distill/ddgpu/invertible.py:179: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:835.)
+  return sum(terms.values()), {k: float(v) for k, v in terms.items()}
+loss=260.2 rec=1.411 cyc=0.9714 anc_g=4.867 anc_e=11.6 mmd=2.716 ksd=1.724 mom=236.9 it=1 s_per_it=0.3428 gpu_hours=9.521e-05
+loss=233 rec=1.334 cyc=0.989 anc_g=4.943 anc_e=11.78 mmd=2.635 ksd=7.864 mom=203.4 it=2 s_per_it=0.2023 gpu_hours=0.0001124
+loss=188.9 rec=1.244 cyc=0.9491 anc_g=4.877 anc_e=11.62 mmd=2.654 ksd=0.5843 mom=166.9 it=3 s_per_it=0.1529 gpu_hours=0.0001274
+DIAG eff_rank=14.7 eff_rank_frac=0.919 cvm_mean=0.03307 cvm_max=0.1468 roundtrip_z=0.9779 roundtrip_x=1.244 z_std=2.245 z_mean_abs=0.4756
+loss=216.9 rec=1.305 cyc=0.9496 anc_g=4.571 anc_e=10.89 mmd=2.524 ksd=1.285 mom=195.3 it=4 s_per_it=0.1498 gpu_hours=0.0001665
+loss=206.4 rec=1.291 cyc=0.9926 anc_g=4.771 anc_e=11.37 mmd=2.575 ksd=1.814 mom=183.6 it=5 s_per_it=0.1352 gpu_hours=0.0001877
+loss=134.8 rec=1.019 cyc=0.9507 anc_g=4.879 anc_e=11.63 mmd=2.062 ksd=4.624 mom=109.6 it=6 s_per_it=0.1265 gpu_hours=0.0002109
+DIAG eff_rank=14.02 eff_rank_frac=0.876 cvm_mean=0.02524 cvm_max=0.09687 roundtrip_z=0.9821 roundtrip_x=1.019 z_std=2.031 z_mean_abs=0.4678
+loss=203 rec=1.261 cyc=0.9765 anc_g=4.678 anc_e=11.15 mmd=2.481 ksd=3.582 mom=178.8 it=7 s_per_it=0.1228 gpu_hours=0.0002388
+loss=160.2 rec=1.137 cyc=0.9689 anc_g=4.739 anc_e=11.29 mmd=2.429 ksd=2.168 mom=137.4 it=8 s_per_it=0.1177 gpu_hours=0.0002615
+done 0.9522364139556885
+[dd]      cheap-tier smoke: registry teacher -> clone -> train, both arms
+config from dataset meta.json: {'sigma_data': 0.5, 'shape': [3, 8, 8], 'n_classes': 1, 'space': 'synthetic', 'format': 'gaussian'}
+teacher: {"family": "synthetic", "space": "synthetic", "arch": "tiny-mlp", "shape": [3, 8, 8], "dims": 192, "n_classes": 1, "sigma_min": 0.002, "sigma_max": 80.0, "n_params": 29056, "cfg_capable": false, "spec": "synthetic:net=mlp,c=3,hw=8,sd=0.5"}
+TEACHER-CHECK {"rel_mse@0.01": 0.0003982238912409478, "rel_mse@0.1": 0.03839256269788332, "rel_mse@0.5": 0.5038484413024718, "rel_mse@2": 0.9412628343094165, "rel_mse@20": 0.9994777817895744, "rel_mse@100": 1.0000712169603962, "identity_err": 1.6423651007453024e-11, "mean_err": 0.019431883880568327, "monotone": true, "verdict": "OK"}
+sigma_max resolved from the teacher: 80.000
+{
+ "seed": 0,
+ "arch": null,
+ "latent_size": 8,
+ "shape": [
+  3,
+  8,
+  8
+ ],
+ "n_classes": 1,
+ "sigma_data": 0.5,
+ "sigma_max": 80.0,
+ "P_mean": -1.2,
+ "P_std": 1.2,
+ "micro_batch": 32,
+ "steps": 6,
+ "lr_g": 1e-05,
+ "lr_d": 1e-05,
+ "clip": 1.0,
+ "n_student_steps": 1,
+ "cfg_scale": 1.0,
+ "d_steps": 1,
+ "log_every": 1,
+ "diag_every": 100,
+ "ckpt_every": 1000,
+ "workers": 0,
+ "amp": false,
+ "data": "gaussian:c=3,hw=8,sd=0.5,n=1024",
+ "teacher_ckpt": null,
+ "init_from_teacher": true,
+ "out": "runs/smokeC",
+ "track": "A",
+ "mode": "robust",
+ "n_synth": 512,
+ "lam_gate_mult": 1.0,
+ "lam_estimator": "dsm",
+ "lam_calib_every": 4,
+ "lam_min_count": 8,
+ "lam_ema": 0.999,
+ "probe_every": 3,
+ "ema_decay": 0.99,
+ "teacher": "synthetic:net=mlp,c=3,hw=8,sd=0.5",
+ "teacher_format": "official",
+ "precond": "edm",
+ "sigma_dist": "lognormal",
+ "validate_teacher": true,
+ "strict_teacher": false,
+ "space": "synthetic",
+ "format": "gaussian",
+ "teacher_family": "synthetic",
+ "teacher_sigma_max": 80.0,
+ "teacher_sigma_min": 0.002
+}
+loss_d=0.622 loss_g=8.499e-10 lam=1 sigma=0.4688 it=1 s_per_it=0.2811 gpu_hours=7.809e-05
+loss_d=0.6827 loss_g=5.766e-09 lam=1 sigma=0.6252 it=2 s_per_it=0.145 gpu_hours=8.056e-05
+loss_d=0.6094 loss_g=2.796e-08 lam=1 sigma=0.8598 it=3 s_per_it=0.1001 gpu_hours=8.34e-05
+PROBE real:lam@med=1.000 student:lam@med=0.476
+loss_d=0.6343 loss_g=1.343e-08 lam=1 sigma=0.6173 it=4 s_per_it=0.07992 gpu_hours=8.88e-05
+loss_d=0.6225 loss_g=4.022e-08 lam=1 sigma=0.8795 it=5 s_per_it=0.06546 gpu_hours=9.091e-05
+loss_d=0.6441 loss_g=5.964e-09 lam=1 sigma=0.3797 it=6 s_per_it=0.05568 gpu_hours=9.281e-05
+PROBE real:lam@med=1.000 student:lam@med=0.472
+done 0.35087060928344727
+config from dataset meta.json: {'sigma_data': 0.5, 'shape': [3, 8, 8], 'n_classes': 1, 'space': 'synthetic', 'format': 'gaussian'}
+teacher: {"family": "synthetic", "space": "synthetic", "arch": "tiny-mlp", "shape": [3, 8, 8], "dims": 192, "n_classes": 1, "sigma_min": 0.002, "sigma_max": 80.0, "n_params": 29056, "cfg_capable": false, "spec": "synthetic:net=mlp,c=3,hw=8,sd=0.5"}
+TEACHER-CHECK {"rel_mse@0.01": 0.0003982238912409478, "rel_mse@0.1": 0.03839256269788332, "rel_mse@0.5": 0.5038484413024718, "rel_mse@2": 0.9412628343094165, "rel_mse@20": 0.9994777817895744, "rel_mse@100": 1.0000712169603962, "identity_err": 1.6423651007453024e-11, "mean_err": 0.019431883880568327, "monotone": true, "verdict": "OK"}
+sigma_max resolved from the teacher: 80.000
+{
+ "seed": 0,
+ "arch": null,
+ "latent_size": 8,
+ "shape": [
+  3,
+  8,
+  8
+ ],
+ "n_classes": 1,
+ "sigma_data": 0.5,
+ "sigma_max": 80.0,
+ "P_mean": -1.2,
+ "P_std": 1.2,
+ "micro_batch": 32,
+ "steps": 6,
+ "lr_g": 1e-05,
+ "lr_d": 1e-05,
+ "clip": 1.0,
+ "n_student_steps": 1,
+ "cfg_scale": 1.0,
+ "d_steps": 1,
+ "log_every": 1,
+ "diag_every": 100,
+ "ckpt_every": 1000,
+ "workers": 0,
+ "amp": false,
+ "data": "gaussian:c=3,hw=8,sd=0.5,n=1024",
+ "teacher_ckpt": null,
+ "init_from_teacher": true,
+ "out": "runs/smokeC_dmd2",
+ "track": "A",
+ "mode": "teacher",
+ "n_synth": 512,
+ "lam_min_count": 8,
+ "probe_every": 0,
+ "ema_decay": 0.99,
+ "teacher": "synthetic:net=mlp,c=3,hw=8,sd=0.5",
+ "teacher_format": "official",
+ "precond": "edm",
+ "sigma_dist": "lognormal",
+ "validate_teacher": true,
+ "strict_teacher": false,
+ "gan_weight": 0.001,
+ "space": "synthetic",
+ "format": "gaussian",
+ "teacher_family": "synthetic",
+ "teacher_sigma_max": 80.0,
+ "teacher_sigma_min": 0.002
+}
+loss_gan_d=0.9999 loss_d=0.623 loss_g=3.205e-05 lam=1 sigma=0.7683 loss_gan_g=0.03204 it=1 s_per_it=0.4172 gpu_hours=0.0001159
+loss_gan_d=1 loss_d=0.6263 loss_g=3.055e-05 lam=1 sigma=0.5389 loss_gan_g=0.03055 it=2 s_per_it=0.2164 gpu_hours=0.0001202
+loss_gan_d=0.9978 loss_d=0.6114 loss_g=3.093e-05 lam=1 sigma=0.4328 loss_gan_g=0.03093 it=3 s_per_it=0.149 gpu_hours=0.0001242
+loss_gan_d=0.9976 loss_d=0.5775 loss_g=3.101e-05 lam=1 sigma=0.5713 loss_gan_g=0.03101 it=4 s_per_it=0.1154 gpu_hours=0.0001282
+loss_gan_d=0.9976 loss_d=0.677 loss_g=3.148e-05 lam=1 sigma=0.496 loss_gan_g=0.03147 it=5 s_per_it=0.09553 gpu_hours=0.0001327
+loss_gan_d=0.9994 loss_d=0.6857 loss_g=2.794e-05 lam=1 sigma=0.3797 loss_gan_g=0.02793 it=6 s_per_it=0.08279 gpu_hours=0.000138
+done 0.5437486171722412
+[dd]      Phase A self-test against a target whose true score is known
+{
+ "family": "synthetic",
+ "space": "synthetic",
+ "arch": "gaussian(sd=0.5)",
+ "shape": [
+  4,
+  8,
+  8
+ ],
+ "dims": 256,
+ "n_classes": 1,
+ "sigma_min": 0.001,
+ "sigma_max": 1000.0,
+ "n_params": 0,
+ "cfg_capable": false,
+ "spec": "synthetic:c=4,hw=8,sd=0.5,bias=0.15"
+}
+TEACHER-CHECK {"rel_mse@0.01": 0.0003957707205632368, "rel_mse@0.1": 0.038210699116477446, "rel_mse@0.5": 0.507657707711731, "rel_mse@2": 1.280663457582879, "rel_mse@20": 37.35196493335162, "rel_mse@100": 889.3704590912745, "identity_err": 2.1163736100624572e-11, "mean_err": 873.6829343256904, "monotone": true, "verdict": "OK"}
+
+== DSM lambda + held-out gain (256 dims) ==
+  sigma=   0.0500  lam_hat=1.000  grid_argmin=1.000  gain_vs_teacher=1.0000
+  sigma=   0.1778  lam_hat=1.000  grid_argmin=1.000  gain_vs_teacher=1.0000
+  sigma=   0.6325  lam_hat=1.000  grid_argmin=1.000  gain_vs_teacher=1.0000
+  sigma=   2.2494  lam_hat=0.420  grid_argmin=0.400  gain_vs_teacher=0.8392
+  sigma=   8.0000  lam_hat=0.003  grid_argmin=0.000  gain_vs_teacher=0.1503
+
+== off-manifold proxy (ratio statistic, lower bound) ==
+/root/autodl-tmp/diffusion-distill/exp/10_lambda_real.py:165: DeprecationWarning: __array__ implementation doesn't accept a copy keyword, so passing copy=False failed. __array__ must implement 'dtype' and 'copy' keyword arguments. To learn more, see the migration guide https://numpy.org/devdocs/numpy_2_0_migration_guide.html#adapting-to-changes-in-the-copy-keyword
+  med = np.nanmedian(np.array(lam))
+  real      median lam_ratio = 0.295
+  blur      median lam_ratio = 0.462
+  shift     median lam_ratio = 0.271
+  collapse  median lam_ratio = 0.423
+
+[json] results/lambda_real/selftest.json
+[fig] results/lambda_real/selftest.png
+
+BEST held-out gain vs plain teacher: 0.1503 at sigma=8.000 (lambda=0.003)
+gain < 1.0 means the fusion reduces true score MSE. That is the claim.
+[dd] 5/5  VRAM + throughput probe (this is the number RUNPLAN.md cannot derive)
+{"arch": "DiT-B/2", "res": 32, "method": "dmd2", "micro": 8, "opt": "adam_fp32", "peak_gib": 4.71, "step_s": 0.1433, "samples_per_s": 55.8}
+{"arch": "DiT-B/2", "res": 32, "method": "dmd2", "micro": 16, "opt": "adam_fp32", "peak_gib": 4.71, "step_s": 0.1285, "samples_per_s": 124.5}
+{"arch": "DiT-B/2", "res": 32, "method": "dmd2", "micro": 32, "opt": "adam_fp32", "peak_gib": 4.71, "step_s": 0.2057, "samples_per_s": 155.6}
+{"arch": "DiT-B/2", "res": 32, "method": "dmd2", "micro": 64, "opt": "adam_fp32", "peak_gib": 5.25, "step_s": 0.4294, "samples_per_s": 149.0}
+{"arch": "DiT-B/2", "res": 32, "method": "dmd2", "micro": 128, "opt": "adam_fp32", "peak_gib": 7.07, "step_s": 0.8319, "samples_per_s": 153.9}
+{"arch": "DiT-B/2", "res": 32, "method": "invertible", "micro": 8, "opt": "adam_fp32", "peak_gib": 6.69, "step_s": 0.2041, "samples_per_s": 39.2}
+{"arch": "DiT-B/2", "res": 32, "method": "invertible", "micro": 16, "opt": "adam_fp32", "peak_gib": 6.68, "step_s": 0.1893, "samples_per_s": 84.5}
+{"arch": "DiT-B/2", "res": 32, "method": "invertible", "micro": 32, "opt": "adam_fp32", "peak_gib": 6.69, "step_s": 0.2993, "samples_per_s": 106.9}
+{"arch": "DiT-B/2", "res": 32, "method": "invertible", "micro": 64, "opt": "adam_fp32", "peak_gib": 7.69, "step_s": 0.6143, "samples_per_s": 104.2}
+{"arch": "DiT-B/2", "res": 32, "method": "invertible", "micro": 128, "opt": "adam_fp32", "peak_gib": 9.92, "step_s": 1.2041, "samples_per_s": 106.3}
+{"arch": "DiT-B/2", "res": 64, "method": "dmd2", "micro": 8, "opt": "adam_fp32", "peak_gib": 4.72, "step_s": 0.2255, "samples_per_s": 35.5}
+{"arch": "DiT-B/2", "res": 64, "method": "dmd2", "micro": 16, "opt": "adam_fp32", "peak_gib": 5.27, "step_s": 0.4534, "samples_per_s": 35.3}
+{"arch": "DiT-B/2", "res": 64, "method": "dmd2", "micro": 32, "opt": "adam_fp32", "peak_gib": 7.07, "step_s": 0.9059, "samples_per_s": 35.3}
+{"arch": "DiT-B/2", "res": 64, "method": "dmd2", "micro": 64, "opt": "adam_fp32", "peak_gib": 10.88, "step_s": 1.7784, "samples_per_s": 36.0}
+{"arch": "DiT-B/2", "res": 64, "method": "dmd2", "micro": 128, "opt": "adam_fp32", "peak_gib": 18.49, "step_s": 3.5055, "samples_per_s": 36.5}
+{"arch": "DiT-B/2", "res": 64, "method": "invertible", "micro": 8, "opt": "adam_fp32", "peak_gib": 6.69, "step_s": 0.327, "samples_per_s": 24.5}
+{"arch": "DiT-B/2", "res": 64, "method": "invertible", "micro": 16, "opt": "adam_fp32", "peak_gib": 7.68, "step_s": 0.6545, "samples_per_s": 24.4}
+{"arch": "DiT-B/2", "res": 64, "method": "invertible", "micro": 32, "opt": "adam_fp32", "peak_gib": 9.91, "step_s": 1.3028, "samples_per_s": 24.6}
+{"arch": "DiT-B/2", "res": 64, "method": "invertible", "micro": 64, "opt": "adam_fp32", "peak_gib": 15.08, "step_s": 2.5601, "samples_per_s": 25.0}
+{"arch": "DiT-B/2", "res": 64, "method": "invertible", "micro": 128, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 32, "method": "dmd2", "micro": 8, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 32, "method": "dmd2", "micro": 16, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 32, "method": "dmd2", "micro": 32, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 32, "method": "dmd2", "micro": 64, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 32, "method": "dmd2", "micro": 128, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 32, "method": "invertible", "micro": 8, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 32, "method": "invertible", "micro": 16, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 32, "method": "invertible", "micro": 32, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 32, "method": "invertible", "micro": 64, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 32, "method": "invertible", "micro": 128, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 64, "method": "dmd2", "micro": 8, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 64, "method": "dmd2", "micro": 16, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 64, "method": "dmd2", "micro": 32, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 64, "method": "dmd2", "micro": 64, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 64, "method": "dmd2", "micro": 128, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 64, "method": "invertible", "micro": 8, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 64, "method": "invertible", "micro": 16, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 64, "method": "invertible", "micro": 32, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 64, "method": "invertible", "micro": 64, "peak_gib": null, "oom": true}
+{"arch": "DiT-XL/2", "res": 64, "method": "invertible", "micro": 128, "peak_gib": null, "oom": true}
+[dd] compare results/probe.json against RUNPLAN.md; the probe wins
+[dd] smoke OK
+root@autodl-container-5e96488cf6-57f363db:~/autodl-tmp/diffusion-distill# 
