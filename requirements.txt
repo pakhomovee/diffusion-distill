@@ -1,0 +1,17 @@
+# Dependencies beyond PyTorch.
+#
+# torch / torchvision are DELIBERATELY not pinned here. AutoDL images ship a
+# working CUDA build matched to the driver, and `pip install torch` behind the
+# network_turbo proxy is the fastest way to replace it with a broken one. On a
+# 5090 (sm_120) you need CUDA 12.8+ / torch >= 2.7; check with
+#   python3 -c "import torch;print(torch.__version__, torch.cuda.get_device_capability())"
+# before assuming anything else here matters.
+
+numpy>=1.24
+scipy>=1.10           # linalg.sqrtm, for the Frechet distance
+pillow>=9.0
+diffusers>=0.27       # AutoencoderKL (SD-VAE) only
+safetensors>=0.4
+huggingface_hub>=0.20
+pytorch-fid>=0.3.0    # the canonical FID InceptionV3; ddgpu.prepare + ddgpu.generate
+matplotlib>=3.7       # figures/ only

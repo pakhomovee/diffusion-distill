@@ -682,3 +682,177 @@ found it collapses at d=512. ENTRY 011 replaced it with something derived. That
 whole arc cost about two hours of one CPU core. On the GPU VM the same arc is
 four multi-day runs, and the d=512 failure would have arrived as an unexplained
 regression at higher resolution rather than as a diagnosable bug.
+
+
+================================================================================
+ENTRY 012 -- THE GPU PIPELINE, AND THE TEACHER PROBLEM IT HAD TO SOLVE FIRST
+================================================================================
+
+Everything before this entry was CPU work against closed-form targets. This one
+builds the machinery to run on real data on a real box, and it turned up one
+blocker that would have wasted the first multi-day run.
+
+--------------------------------------------------------------------------------
+FINDING 19 -- the released teacher is in a different parameterisation, and
+loading it would have failed SILENTLY
+
+FINDINGS.md 4.0.1 listed "teacher checkpoints" as an unresolved prerequisite and
+resolved it in favour of option 1: run the dimension ladder on DiT-XL/2 @256 vs
+@512, both public, same architecture and data. That is the right call. What it
+did not say is that the released checkpoints cannot be loaded by this codebase
+as written.
+
+ddgpu/dit.py + ddgpu/edm.py implement an EDM denoiser: D(x, sigma, y) on
+x = x0 + sigma*eps, with c_noise = log(sigma)/4 and c_in = 1/sqrt(sigma^2+sd^2).
+facebook's DiT-XL-2-*.pt is a VP model: it predicts eps from
+x_t = sqrt(abar_t) x0 + sqrt(1-abar_t) eps at a DISCRETE timestep on a linear
+beta schedule, and outputs 8 channels (learn_sigma).
+
+Three things follow, and none of them raises:
+
+  1. calling the checkpoint through EDMWrapper feeds it the wrong input scaling
+     and the wrong noise conditioning -> a teacher that returns noise;
+  2. `init_from_teacher: true` then hands the STUDENT those same weights under
+     that wrong preconditioning, so the warm start is not a warm start;
+  3. sigma_max was hardcoded to EDM's 80. The linear-1000 schedule tops out at
+     sigma = 157.407. A one-step student generating from 80 starts half way up
+     the schedule it was initialised from -- pure quality loss, no error message.
+
+FIX: ddgpu/vp.py. VPSchedule (betas -> abar -> sigma table, with a continuous
+sigma <-> t inversion by interpolation in log-sigma) and VPPrecond, which
+presents a VP eps-predictor through the EXACT same surface as EDMWrapper
+(forward / score / cfg_score / _coef). The change of variables is Karras et al.
+App. C: x_t = sqrt(abar) x, so
+
+    c_in = sqrt(abar) = 1/sqrt(1+sigma^2),  c_noise = t(sigma),
+    c_skip = 1,  c_out = -sigma,  score = -eps_hat/sigma.
+
+Student, critic and teacher all use VPPrecond, so init_from_teacher is an exact
+warm start and no trainer had to change. sigma_max is now resolved FROM the
+schedule at startup rather than written in a config.
+
+Verified in tests/test_pipeline.py against an oracle eps-predictor for a
+Gaussian target, where the true score is -x/(sd^2+sigma^2): agreement to
+7e-8 relative across sigma = 0.02 .. 100. That exercises c_in, t_of_sigma and
+the eps->score conversion together; getting any one of them wrong fails it.
+
+--------------------------------------------------------------------------------
+FINDING 20 -- the positional grid is the one thing a checkpoint load cannot
+be trusted on
+
+ddgpu/dit.py registers `pos` as a NON-PERSISTENT buffer, recomputed from
+sincos_pos_embed. The official checkpoint ships `pos_embed` as a stored tensor.
+So a state-dict load simply ignores it, and if the two grids disagree the model
+loads cleanly, trains without complaint, and produces subtly wrong samples
+forever. There is no loss curve on which this is visible.
+
+ddgpu/ckpt.py therefore COMPARES them and refuses the checkpoint if the max
+absolute difference exceeds 1e-4. Measured on our grid against an independent
+transcription of facebookresearch/DiT's get_2d_sincos_pos_embed: max |err| =
+0.0 at (1152,16), (1152,32) and (768,16) -- bit-exact, including the
+easy-to-invert meshgrid ordering (the first half of the embedding is the
+W coordinate, not H). The check stays in as a regression guard, and a test
+deliberately corrupts pos_embed to prove the refusal fires.
+
+The remap itself (132 keys: x_embedder.proj->x_embed, mlp.fc1->mlp.0,
+adaLN_modulation->ada, final_layer.linear->final.lin, ...) round-trips with zero
+missing and zero unexpected keys and a bit-exact forward pass.
+
+--------------------------------------------------------------------------------
+FINDING 21 -- sigma_data and the noise distribution were both inherited from a
+different VAE
+
+EDM's sigma_data=0.5 is calibrated for EDM's own data scaling. SD-VAE latents
+scaled by 0.18215 -- the scaling DiT and LDM train with -- are approximately
+unit variance. Since dsm_weight(sigma, sigma_data) = (sigma^2+sd^2)/(sigma*sd)^2
+drives the critic's loss at every noise level, a 2x error in sd is a systematic
+mis-weighting across the whole schedule.
+
+ddgpu/prepare.py now MEASURES sigma_data during the VAE encode and writes it to
+meta.json; ddgpu/train.py reads it, along with shape / latent_size / n_classes,
+and writes the resolved config to <run>/config.resolved.json. Nothing in a
+config file is allowed to guess a fact about an artefact any more.
+
+Same argument for the training noise distribution. EDM's lognormal
+(P_mean=-1.2, P_std=1.2) puts essentially all its mass in sigma = 0.03..3. The
+VP teacher's schedule runs 0.01..157. Sampling lognormally would train the
+student against a teacher evaluated almost exclusively in the bottom quarter of
+its own range. Default is now sigma_dist="vp_uniform_t" -- uniform over
+timesteps t in [20, 979], which is what DMD2 does. The window ends are not
+cosmetic: below t=20, sigma < 0.08, and cdist's ||a||^2+||b||^2-2a.b carries
+~1e-3 absolute error at d=16384, which divided by 2*sigma^2 randomises the
+empirical score's softmax weights.
+
+--------------------------------------------------------------------------------
+FINDING 22 -- first measurement of the lambda drift, and it already has the
+predicted shape
+
+FINDINGS.md 3.1 called this the highest-value nearly-free addition: the
+off-manifold mechanism (1.2) predicts lambda should be LOWER at student samples
+than at real ones, and should drift up as the student converges.
+
+The shipped DSM calibrator cannot measure it -- it needs g = -eps/sigma on
+held-out REAL data to be an unbiased draw of the true score, and there is no
+such quantity at a student sample. So robust.py gains LambdaProbe, which uses
+the ratio statistic V_B / E||A-B||^2 instead. That statistic needs no ground
+truth and is computable anywhere. It is a LOWER BOUND on lambda* (it drops the
+<b_B,u> term, ENTRY 001), so it is not comparable to the training lambda -- but
+every term that makes the bound loose is common to both legs, so real-vs-student
+at matched sigma and matched batch is a valid comparison.
+
+In the 8-step CPU smoke run, on synthetic latents, with an untrained student:
+
+    PROBE  real:lam@med=1.000   student:lam@med=0.608     (it 4)
+    PROBE  real:lam@med=1.000   student:lam@med=0.530     (it 8)
+
+That is 1.2's signature, on the first try: the real batch is worth nothing
+against on-distribution points and roughly half the weight against student
+samples. It is a toy target and an untrained student, so it is a wiring check
+and not evidence -- but the wiring is what was in doubt. It runs every
+probe_every=2500 steps on every rank (it all-gathers the real batch; a
+rank-0-only call would deadlock), and exp/09_plot_run.py turns the series into
+the drift figure.
+
+--------------------------------------------------------------------------------
+SMALLER THINGS THAT WOULD HAVE COST A RUN
+
+  * DDP broadcast_buffers defaults to True, and that broadcast is a COLLECTIVE
+    inside forward. Track B's `diagnose` is a rank-0-only call. Set to False --
+    our only buffer is the deterministic positional grid.
+  * No EMA of the student existed. Every DMD/DMD2 number in the literature is an
+    EMA number; comparing raw weights against them compares different things.
+    Added, and it is what ddgpu.generate scores by default.
+  * No resume. A 5.5-day 512px run on a metered box needs one, and it must
+    restore accumulated GPU-SECONDS, or the eval harness -- which compares on
+    GPU-seconds -- sees a resumed run as artificially cheap.
+  * The effective-real-batch floor from 1.4 was documented and unenforced. It is
+    now a launcher check that REFUSES to start below N=256, because the failure
+    is a quietly degraded result rather than a crash. At 512px with micro=16 on
+    8 GPUs the effective batch is 128, so this fires on a configuration we would
+    plausibly have run.
+
+--------------------------------------------------------------------------------
+WHAT IS NOW RUNNABLE
+
+  scripts/smoke.sh [--gpu]                          pre-flight, incl. VRAM probe
+  scripts/train.sh -d imagenet256 --mode dmd2|robust|invert ...
+  scripts/eval_all.sh -d imagenet256 ...            matched-wall-clock table
+  exp/09_plot_run.py runs/<name>                    lambda curve + drift figures
+
+Configs are GENERATED by scripts/mkconfig.py rather than hand-maintained,
+because FINDINGS.md 4.0's claim -- baseline and method differ by exactly the
+score-fusion switch, so a measured difference cannot be an implementation
+artefact -- is only true if something enforces it. train.sh prints the delta at
+launch and tests/test_pipeline.py:t_config_delta pins it to eight keys.
+
+30 new invariant tests, all passing, alongside the existing 29. Both smoke
+tracks run end to end, and resume was verified to continue at the right step
+with GPU-seconds carried forward.
+
+STILL NOT DONE, and worth being explicit about: nothing here has touched a GPU.
+The VP change of variables is verified against an oracle rather than against the
+real DiT-XL/2 weights, because the checkpoint is a 2.7 GB download this box has
+no reason to hold. The first thing to run on the VM is `scripts/smoke.sh --gpu`
+followed by the teacher fetch, which verifies the positional grid against the
+real file -- that is the moment FINDING 20's guard either passes or earns its
+keep.

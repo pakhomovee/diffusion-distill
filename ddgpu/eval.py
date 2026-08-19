@@ -134,3 +134,44 @@ def inversion_metrics(G, E, real_x, real_y, sigma_max, n_edit_dirs=8):
                           .reshape(len(z), -1).norm(dim=1) for s in steps])
         cors.append(float(torch.corrcoef(torch.stack([steps, dx.mean(1)]))[0, 1]))
     return dict(recon_mse=recon, cycle_mse=cyc, edit_linearity=float(np.mean(cors)))
+
+
+# ---------------------------------------------------------------------------
+# CLI: render a table from the records ddgpu.generate accumulates
+# ---------------------------------------------------------------------------
+def records_from_json(path, weights=None, step=None):
+    """Rebuild RunRecords from `results/*.json`, keeping the latest per run."""
+    rows = json.load(open(path))
+    if weights:
+        rows = [r for r in rows if (r.get("extra") or {}).get("weights") == weights]
+    if step is not None:
+        rows = [r for r in rows if r["step"] == step]
+    latest = {}
+    for r in rows:                       # last writer per (name) wins
+        latest[r["name"]] = r
+    return [RunRecord(r["name"], r["gpu_seconds"], r["n_gpus"], r["step"], r["fid"],
+                      r["precision"], r["recall"], r["nfe"], r.get("extra"))
+            for r in latest.values()]
+
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(description="Matched-wall-clock comparison table")
+    p.add_argument("--records", required=True, help="results/<dataset>_runs.json")
+    p.add_argument("--tol", type=float, default=0.15)
+    p.add_argument("--weights", default=None, help="filter on ema/student")
+    p.add_argument("--step", type=int, default=None)
+    a = p.parse_args()
+    recs = records_from_json(a.records, a.weights, a.step)
+    if not recs:
+        raise SystemExit(f"no records in {a.records} matching the filters")
+    if len(recs) == 1:
+        r = recs[0]
+        print(f"{r.name}: FID {r.fid:.2f}  prec {r.precision:.3f}  "
+              f"rec {r.recall:.3f}  {r.gpu_seconds/3600:.1f} GPU-h  NFE {r.nfe}")
+        return
+    print(comparison_table(recs, tol=a.tol))
+
+
+if __name__ == "__main__":
+    main()

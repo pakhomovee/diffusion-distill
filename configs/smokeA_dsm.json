@@ -36,5 +36,7 @@
  "lam_estimator": "dsm",
  "lam_calib_every": 1,
  "lam_min_count": 8,
- "lam_ema": 0.98
+ "lam_ema": 0.98,
+ "probe_every": 4,
+ "ema_decay": 0.99
 }

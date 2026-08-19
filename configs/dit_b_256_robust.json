@@ -36,5 +36,10 @@
  "lam_gate_mult": 1.0,
  "lam_estimator": "dsm",
  "lam_calib_every": 4,
- "lam_min_count": 256
+ "lam_min_count": 256,
+ "precond": "edm",
+ "teacher_format": "raw",
+ "sigma_dist": "lognormal",
+ "ema_decay": 0.999,
+ "probe_every": 2500
 }

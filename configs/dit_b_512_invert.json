@@ -39,5 +39,10 @@
  "anchor_batch": 32,
  "n_anchors": 50000,
  "anchor_steps": 32,
- "anchor_path": "/data/anchors_dit_b2_512.pt"
+ "anchor_path": "/data/anchors_dit_b2_512.pt",
+ "precond": "edm",
+ "teacher_format": "raw",
+ "sigma_dist": "lognormal",
+ "ema_decay": 0.999,
+ "probe_every": 2500
 }

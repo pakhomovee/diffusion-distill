@@ -2,6 +2,16 @@
 
 Target hardware: **NVIDIA RTX 5090, 32 GiB GDDR7, no NVLink (PCIe 5.0 x16 only).**
 
+> **The teacher is DiT-XL/2 for every run** (FINDINGS.md §4.0.1, decided in
+> favour of option 1). That makes the ladder XL@256 vs XL@512 rather than
+> DiT-B/2, so the DiT-B rows below are only reachable if we ever pretrain our own
+> teacher. The XL@512 leg is the 5.5-day row, and it is the real price of the
+> decision. Launchers and configs for the XL path are in `scripts/`.
+>
+> The released checkpoints are **VP** models, not EDM ones; `ddgpu/vp.py` handles
+> the change of variables and `sigma_max` is **157.4**, not 80. See LOG.log
+> ENTRY 012 before changing anything about noise schedules.
+
 All numbers below are **derived**, not quoted: parameter counts come from
 instantiating `ddgpu/dit.py` on the meta device, memory from `ddgpu/memcalc.py`,
 wall-clock from a FLOP model at 38% MFU. Regenerate with `python exp/plan_gpus.py`.
@@ -174,9 +184,15 @@ first safe row. This is a correctness requirement, not an optimisation:
 ## Sanity checks to run before each long job
 
 ```bash
-python -m ddgpu.probe --sweep                       # real VRAM + step time
-python -m ddgpu.train --config configs/smokeA.json  # Track A, 8 steps, CPU-safe
-python -m ddgpu.train --config configs/smokeB.json  # Track B, 8 steps, CPU-safe
+scripts/smoke.sh --gpu      # invariant tests + both tracks + the VRAM/throughput probe
+```
+
+That is all three of the old commands plus `tests/test_pipeline.py`, in order,
+failing fast. On a fresh box also run the teacher fetch once, because it is the
+first thing that verifies the released weights against our DiT:
+
+```bash
+python3 -m ddgpu.ckpt --name DiT-XL-2-256x256 --dir ckpt
 ```
 
 For Track B specifically, watch `DIAG eff_rank_frac` in the first 500 steps. It

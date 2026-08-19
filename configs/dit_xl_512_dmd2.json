@@ -4,11 +4,11 @@
  "precond": "vp",
  "n_timestep": 1000,
  "arch": null,
- "latent_size": 32,
+ "latent_size": 64,
  "shape": [
   4,
-  32,
-  32
+  64,
+  64
  ],
  "n_classes": 1000,
  "learn_sigma": null,
@@ -35,11 +35,11 @@
  "workers": 4,
  "amp": true,
  "flip": false,
- "data": "data/in256",
- "teacher_ckpt": "ckpt/DiT-XL-2-256x256.pt",
+ "data": "data/in512",
+ "teacher_ckpt": "ckpt/DiT-XL-2-512x512.pt",
  "teacher_format": "official",
  "init_from_teacher": true,
- "out": "runs/dit_xl_256_dmd2",
+ "out": "runs/dit_xl_512_dmd2",
  "gather_real": true,
  "mode": "teacher",
  "gan_weight": 0.001

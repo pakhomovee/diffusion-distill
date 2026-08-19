@@ -31,5 +31,10 @@
  "out": "runs/dit_b_256_fixed",
  "track": "A",
  "mode": "fixed",
- "fixed_lam": 0.5
+ "fixed_lam": 0.5,
+ "precond": "edm",
+ "teacher_format": "raw",
+ "sigma_dist": "lognormal",
+ "ema_decay": 0.999,
+ "probe_every": 2500
 }

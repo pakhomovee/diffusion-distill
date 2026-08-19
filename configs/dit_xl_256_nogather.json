@@ -20,7 +20,7 @@
  "P_mean": -1.2,
  "P_std": 1.2,
  "micro_batch": 32,
- "steps": 50000,
+ "steps": 20000,
  "lr_g": 1e-05,
  "lr_d": 1e-05,
  "clip": 1.0,
@@ -39,8 +39,13 @@
  "teacher_ckpt": "ckpt/DiT-XL-2-256x256.pt",
  "teacher_format": "official",
  "init_from_teacher": true,
- "out": "runs/dit_xl_256_dmd2",
- "gather_real": true,
- "mode": "teacher",
- "gan_weight": 0.001
+ "out": "runs/dit_xl_256_nogather",
+ "gather_real": false,
+ "mode": "robust",
+ "lam_estimator": "dsm",
+ "lam_calib_every": 4,
+ "lam_ema": 0.999,
+ "lam_min_count": 256,
+ "lam_bins": 32,
+ "lam_gate_mult": null
 }

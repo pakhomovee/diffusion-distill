@@ -13,19 +13,26 @@ import math
 import torch
 import torch.nn.functional as F
 
-from .edm import EDMWrapper, sample_sigma, dsm_weight, edm_sigmas
-from .robust import LambdaEstimator, robust_real_score
+from .edm import EDMWrapper, dsm_weight, edm_sigmas
+from .vp import make_sigma_sampler
+from .robust import LambdaEstimator, LambdaProbe, robust_real_score
 from .gan import GANHead, d_loss, g_loss
 
 
 class DMD2Trainer:
-    def __init__(self, student, critic, teacher, cfg, device="cuda"):
-        """student/critic/teacher: EDMWrapper-wrapped DiTs. cfg: dict-like."""
+    def __init__(self, student, critic, teacher, cfg, device="cuda", schedule=None):
+        """student/critic/teacher: sigma-parameterised denoisers (EDMWrapper or
+        VPPrecond -- the trainer does not care which). cfg: dict-like.
+        schedule: VPSchedule when the teacher is a VP checkpoint, else None."""
         self.G, self.mu, self.T = student, critic, teacher
-        self.c, self.dev = cfg, device
+        self.c, self.dev, self.sch = cfg, device, schedule
         self.sigma_data = cfg["sigma_data"]
-        self.gen_sigmas = edm_sigmas(cfg["n_student_steps"], device=device) \
-            if cfg["n_student_steps"] > 1 else None
+        # Training noise levels. A VP teacher is only trained on its own
+        # schedule, so `vp_uniform_t` (DMD2's choice) puts mass where the
+        # teacher is valid; EDM's lognormal would concentrate in 0.03..3 and
+        # never visit the top three quarters of a 0.01..157 sigma range.
+        self.sample_sigma = make_sigma_sampler(cfg, schedule)
+        self.gen_sigmas = self._student_grid()
         # The gate is expressed as a MULTIPLE of sigma_data, not an absolute
         # sigma, because that is the unit it was measured in. exp01 sweep: the
         # fused estimator is never worse than the better single estimator for
@@ -55,7 +62,20 @@ class DMD2Trainer:
             list(self.gan.parameters()) if self.gan else [])
         self.opt_D = torch.optim.AdamW(params_D, lr=cfg["lr_d"],
                                        betas=(0.0, 0.999), weight_decay=0.01)
+        # Diagnostic only -- never touches the training lambda. See FINDINGS 3.1.
+        self.probe = LambdaProbe(n_bins=cfg.get("probe_bins", 16),
+                                 sigma_max=max(2.0 * cfg["sigma_max"], 200.0),
+                                 device=device)
         self.step_i = 0
+
+    def _student_grid(self):
+        """Backward-Euler sigma grid for a few-step student (None if one-step)."""
+        n = self.c["n_student_steps"]
+        if n <= 1:
+            return None
+        if self.sch is not None:
+            return self.sch.student_sigmas(n).to(self.dev)
+        return edm_sigmas(n, sigma_max=self.c["sigma_max"], device=self.dev)
 
     def _disc(self, x, sigma, y):
         """Discriminator logit, reusing the critic trunk."""
@@ -92,7 +112,7 @@ class DMD2Trainer:
     # ---------------- distribution-matching gradient --------------------
     def dm_loss(self, x0, y, real_batch):
         n = x0.shape[0]
-        sigma = sample_sigma(n, self.c["P_mean"], self.c["P_std"], self.dev)
+        sigma = self.sample_sigma(n, self.dev)
         xt = x0 + sigma.reshape(-1, 1, 1, 1) * torch.randn_like(x0)
 
         with torch.no_grad():
@@ -120,7 +140,7 @@ class DMD2Trainer:
     def critic_loss(self, x0):
         n = x0.shape[0]
         y = torch.randint(0, self.c["n_classes"], (n,), device=self.dev)
-        sigma = sample_sigma(n, self.c["P_mean"], self.c["P_std"], self.dev)
+        sigma = self.sample_sigma(n, self.dev)
         xt = x0 + sigma.reshape(-1, 1, 1, 1) * torch.randn_like(x0)
         D = self.mu(xt, sigma, y)
         w = dsm_weight(sigma, self.sigma_data).reshape(-1, 1, 1, 1)
@@ -137,7 +157,7 @@ class DMD2Trainer:
                 xg = self.generate(n, yg, grad=False)
             ld = self.critic_loss(xg)
             if self.gan is not None:
-                sg = sample_sigma(n, c["P_mean"], c["P_std"], self.dev)
+                sg = self.sample_sigma(n, self.dev)
                 v = sg.reshape(-1, 1, 1, 1)
                 xr_n = real_batch + v * torch.randn_like(real_batch)
                 xg_n = xg + v * torch.randn_like(xg)
@@ -156,7 +176,7 @@ class DMD2Trainer:
             rb = all_gather_batch(real_batch) if c.get("gather_real", True) else real_batch
             ry = all_gather_batch(real_y.reshape(-1, 1, 1, 1).float()).reshape(-1).long() \
                 if c.get("gather_real", True) else real_y
-            sc = sample_sigma(rb.shape[0], c["P_mean"], c["P_std"], self.dev)
+            sc = self.sample_sigma(rb.shape[0], self.dev)
             self.est.calibrate(self.T, rb, ry, sc, cfg=c["cfg_scale"])
 
         # --- generator update ---
@@ -164,7 +184,7 @@ class DMD2Trainer:
         xg = self.generate(n, yg)
         lg, info = self.dm_loss(xg, yg, real_batch)
         if self.gan is not None:
-            sg = sample_sigma(n, c["P_mean"], c["P_std"], self.dev)
+            sg = self.sample_sigma(n, self.dev)
             xg_n = xg + sg.reshape(-1, 1, 1, 1) * torch.randn_like(xg)
             lga = g_loss(self._disc(xg_n, sg, yg))
             lg = lg + c["gan_weight"] * lga
@@ -176,6 +196,42 @@ class DMD2Trainer:
         logs.update(loss_g=lg.item(), **info)
         self.step_i += 1
         return logs
+
+
+    # ---------------- lambda drift diagnostic ---------------------------
+    @torch.no_grad()
+    def probe_lambda(self, real_batch, real_y, n_repeat=4):
+        """Measure the ratio-lambda statistic at real AND student samples.
+
+        FINDINGS 1.2 predicts the two curves start apart -- lower at student
+        samples, where the teacher is off-manifold and the real batch is worth
+        more -- and converge as the student lands on the manifold. That drift is
+        the mechanism claim; this is the measurement of it.
+
+        Both legs share the same sigmas, the same real batch and the same
+        teacher call pattern, so the ratio estimator's known slack is common to
+        them and the DIFFERENCE is still meaningful even though neither number
+        is lambda*. Costs `2 * n_repeat` teacher forwards, run every
+        `probe_every` steps only.
+        """
+        from .robust import all_gather_batch
+        c = self.c
+        rb = all_gather_batch(real_batch) if c.get("gather_real", True) else real_batch
+        n = real_batch.shape[0]
+        out = {}
+        for name, src_y in (("real", real_y), ("student", None)):
+            self.probe.reset()
+            for _ in range(n_repeat):
+                y = (src_y if src_y is not None else
+                     torch.randint(0, c["n_classes"], (n,), device=self.dev))
+                x0 = real_batch if src_y is not None else self.generate(n, y, grad=False)
+                sig = self.sample_sigma(n, self.dev)
+                xt = x0 + sig.reshape(-1, 1, 1, 1) * torch.randn_like(x0)
+                self.probe.observe(self.T, xt, y, sig, rb, cfg=c["cfg_scale"])
+            s, lam, vrel, cnt = self.probe.curve()
+            out[name] = dict(sigma=s.tolist(), lam_ratio=lam.tolist(),
+                             var_rel=vrel.tolist(), count=cnt.tolist())
+        return out
 
 
 def _raw(m):

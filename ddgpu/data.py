@@ -1,27 +1,66 @@
-"""Latent dataset. Expects VAE latents precomputed once to a memmap.
+"""Latent datasets. Expects VAE latents precomputed once by `ddgpu.prepare`.
 
-Precomputing is not optional at this scale: running the SD VAE encoder inside the
-training loop would cost more than the distillation step itself and would pin a
-third model in VRAM. `precompute_latents` writes an (N, C, H, W) float16 memmap
-plus an (N,) int32 label array.
+Precomputing is not optional at this scale: running the SD VAE encoder inside
+the training loop would cost more than the distillation step itself and would
+pin a third model in VRAM.
+
+Two on-disk formats are supported, both float16 memmaps:
+
+  "moments"  (N, 8, H, W)  -- mean and logvar. The latent is *resampled* every
+                             time the sample is read, which is what DiT trains
+                             on and what keeps the dataset from being a frozen
+                             draw. This is what `ddgpu.prepare latents` writes.
+  "latents"  (N, 4, H, W)  -- a single fixed sample. Half the disk, no
+                             resampling. Accepted for externally produced data.
+
+`meta.json` written alongside carries `sigma_data`, `latent_scale` and the
+latent shape; `load_meta` merges those into a run config so no config file has
+to guess them.
 """
+import json
 import os
 import numpy as np
 import torch
 
 
+def load_meta(root):
+    """Read a dataset's meta.json, or return {} for synthetic/legacy data."""
+    p = os.path.join(root, "meta.json")
+    return json.load(open(p)) if os.path.exists(p) else {}
+
+
 class LatentDataset(torch.utils.data.Dataset):
-    def __init__(self, root, split="train", scale=0.18215, flip=True):
-        self.x = np.load(f"{root}/{split}_latents.npy", mmap_mode="r")
+    def __init__(self, root, split="train", scale=None, flip=False):
+        meta = load_meta(root)
+        self.scale = scale if scale is not None else meta.get("latent_scale", 0.18215)
+        self.flip = flip
+        mom, lat = f"{root}/{split}_moments.npy", f"{root}/{split}_latents.npy"
+        if os.path.exists(mom):
+            self.x, self.fmt = np.load(mom, mmap_mode="r"), "moments"
+        elif os.path.exists(lat):
+            self.x, self.fmt = np.load(lat, mmap_mode="r"), "latents"
+        else:
+            raise FileNotFoundError(f"no {split}_moments.npy or {split}_latents.npy in {root}")
         self.y = np.load(f"{root}/{split}_labels.npy", mmap_mode="r")
-        self.scale, self.flip = scale, flip
-        assert len(self.x) == len(self.y)
+        assert len(self.x) == len(self.y), f"{len(self.x)} latents vs {len(self.y)} labels"
+        self.meta = meta
 
     def __len__(self):
         return len(self.x)
 
     def __getitem__(self, i):
-        x = torch.from_numpy(np.asarray(self.x[i], dtype=np.float32)) * self.scale
+        a = torch.from_numpy(np.asarray(self.x[i], dtype=np.float32))
+        if self.fmt == "moments":
+            mean, logvar = a.chunk(2, dim=0)
+            # Clamp as the SD VAE's own DiagonalGaussianDistribution does; a
+            # stray logvar in fp16 would otherwise blow up one sample's scale.
+            x = mean + (0.5 * logvar.clamp(-30.0, 20.0)).exp() * torch.randn_like(mean)
+        else:
+            x = a
+        x = x * self.scale
+        # Horizontal flip in LATENT space is only an approximation of encoding
+        # the flipped image, so it is off by default. Distillation runs see far
+        # less than one epoch of ImageNet, which is why this costs nothing.
         if self.flip and torch.rand(()) < 0.5:
             x = x.flip(-1)
         return x, int(self.y[i])
@@ -53,29 +92,24 @@ class SyntheticLatents(torch.utils.data.Dataset):
         return self.x[i], int(self.y[i])
 
 
-@torch.no_grad()
-def precompute_latents(image_dir, out_root, split, vae, batch=64, device="cuda",
-                       resolution=256, num_workers=8):
-    """One-off VAE encode of an image folder into a float16 memmap."""
-    from torchvision import datasets, transforms
-    tf = transforms.Compose([
-        transforms.Resize(resolution), transforms.CenterCrop(resolution),
-        transforms.ToTensor(), transforms.Normalize([0.5] * 3, [0.5] * 3)])
-    ds = datasets.ImageFolder(image_dir, tf)
-    dl = torch.utils.data.DataLoader(ds, batch, num_workers=num_workers)
-    os.makedirs(out_root, exist_ok=True)
-    lat = None
-    labs = np.zeros(len(ds), np.int32)
-    i = 0
-    for x, y in dl:
-        z = vae.encode(x.to(device)).latent_dist.sample().mul_(1.0).cpu().numpy()
-        if lat is None:
-            lat = np.lib.format.open_memmap(
-                f"{out_root}/{split}_latents.npy", "w+", np.float16,
-                (len(ds),) + z.shape[1:])
-        lat[i:i + len(z)] = z.astype(np.float16)
-        labs[i:i + len(z)] = y.numpy()
-        i += len(z)
-    lat.flush()
-    np.save(f"{out_root}/{split}_labels.npy", labs)
-    return i
+def build_dataset(c):
+    """Dataset + the config fields the data itself determines.
+
+    Returns `(dataset, resolved)` where `resolved` holds `sigma_data`, `shape`,
+    `latent_size` and `n_classes` read from the data's meta.json. Letting the
+    data set these removes a whole class of silent misconfiguration -- a config
+    claiming `sigma_data=0.5` against unit-variance latents mis-weights the DSM
+    loss at every noise level and looks like a bad hyperparameter, not a bug.
+    """
+    if c["data"] == "synthetic":
+        return SyntheticLatents(c.get("n_synth", 8192), tuple(c["shape"]),
+                                c["n_classes"]), {}
+    ds = LatentDataset(c["data"], flip=c.get("flip", False))
+    m = ds.meta
+    resolved = {}
+    if m:
+        resolved["sigma_data"] = m["sigma_data"]
+        resolved["shape"] = m["shape"]
+        resolved["latent_size"] = m["latent_size"]
+        resolved["n_classes"] = m["n_classes"]
+    return ds, resolved

@@ -40,5 +40,7 @@
  "n_anchors": 32,
  "anchor_steps": 4,
  "anchor_path": null,
- "n_synth": 512
+ "n_synth": 512,
+ "probe_every": 0,
+ "ema_decay": 0.99
 }

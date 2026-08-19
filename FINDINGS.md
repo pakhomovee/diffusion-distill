@@ -271,7 +271,7 @@ So "turning on the adaptive λ" is literally `mode: robust` plus the `lam_*` blo
 and it simultaneously turns *off* the hand-tuned GAN term (`gan_weight`), which is
 the thing it claims to replace.
 
-### 4.0.1 Unresolved prerequisite: teacher checkpoints
+### 4.0.1 Teacher checkpoints — RESOLVED (option 1), and it had a hidden cost
 
 Every run needs a pretrained latent-diffusion teacher. **Only DiT-XL/2 is publicly
 released** (256px and 512px). DiT-B/2 is not, so Runs 1, 2 and 4 as specified
@@ -288,8 +288,29 @@ Three ways out, in order of preference:
 3. **Train a DiT-B/2 teacher once** and reuse it across Runs 1/2/4 — worth it only
    if we expect many small-scale ablations.
 
-This choice should be made before anything is launched, because it changes the GPU
-allocation materially.
+**Decision: option 1.** Implemented in `scripts/envs/imagenet{256,512}.env` and
+`ddgpu/ckpt.py`, which downloads and verifies the released weights. Runs 1/2/4
+move to DiT-XL/2, and the DiT-B configs are kept only for the case where we ever
+train our own teacher (`precond: "edm"`, `teacher_format: "raw"`).
+
+**The hidden cost, which was not visible when this was written.** The released
+checkpoints are **VP** models — eps-prediction on a discrete linear-beta
+schedule — while `ddgpu/dit.py` + `ddgpu/edm.py` implement an **EDM** denoiser.
+Loading one into the other does not raise; it produces a teacher that returns
+noise, and `init_from_teacher: true` then propagates the same misreading into the
+student. `ddgpu/vp.py` closes this with a change of variables that presents the VP
+network through the identical `(forward, score, cfg_score, _coef)` surface, so
+student, critic and teacher all share one preconditioning and the warm start is
+exact. Two knock-on corrections:
+
+* **`sigma_max` is 157.4, not 80.** The linear-1000 schedule tops out there. A
+  one-step student generating from 80 starts half way up the schedule it was
+  initialised from. It is now resolved from the schedule, never from a config.
+* **The training noise distribution changes.** EDM's lognormal puts ~all mass in
+  σ ∈ [0.03, 3]; the teacher's range is [0.01, 157]. Default is now
+  `sigma_dist="vp_uniform_t"` over t ∈ [20, 979], which is what DMD2 does.
+
+See LOG.log ENTRY 012, FINDINGS 19–21.
 
 ---
 
@@ -430,3 +451,18 @@ co-scheduled with 4-GPU jobs on the same node — but see the co-location warnin
   — the moment term is doing more work than its weight suggests, KSD less.
 - **The activation-memory model is analytic.** `ddgpu.probe --sweep` measures the
   real numbers; if it disagrees with `RUNPLAN.md`, the probe wins.
+- **Nothing in the pipeline has touched a GPU.** The VP change of variables is
+  verified against an *oracle* eps-predictor on a Gaussian target (agreement to
+  7e-8), not against the real DiT-XL/2 weights. `ddgpu/ckpt.py`'s positional-grid
+  check is the first thing that will exercise the real file; run
+  `python3 -m ddgpu.ckpt --name DiT-XL-2-256x256` on the VM before anything else.
+- **λ_dsm has never been calibrated against a *network* teacher.** Every number
+  in §1 comes from a synthetic teacher with a controllable bias profile. §5's
+  "the synthetic teacher may be unrealistically good at low σ" is now testable
+  cheaply: Run 1 emits the real λ(σ) curve within its first checkpoint interval.
+- **The drift probe is a lower bound, not λ\*.** `LambdaProbe` uses the ratio
+  statistic, which drops the ⟨b_B, u⟩ term and is loosest at small σ. Read the
+  *difference* between the real and student legs, never the levels. The CPU smoke
+  run already shows the predicted split (1.000 vs 0.53–0.61), but against a
+  synthetic target and an untrained student — that is a wiring check, not
+  evidence.

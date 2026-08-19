@@ -1,6 +1,6 @@
 {
  "seed": 0,
- "track": "A",
+ "track": "B",
  "precond": "vp",
  "n_timestep": 1000,
  "arch": null,
@@ -39,8 +39,17 @@
  "teacher_ckpt": "ckpt/DiT-XL-2-256x256.pt",
  "teacher_format": "official",
  "init_from_teacher": true,
- "out": "runs/dit_xl_256_dmd2",
+ "out": "runs/dit_xl_256_invert",
  "gather_real": true,
- "mode": "teacher",
- "gan_weight": 0.001
+ "mode": "invert",
+ "w_mmd": 1.0,
+ "w_ksd": 0.1,
+ "w_moment": 1.0,
+ "w_rec": 1.0,
+ "w_cyc": 1.0,
+ "w_anchor": 1.0,
+ "n_anchors": 50000,
+ "anchor_steps": 32,
+ "lr_e": 1e-05,
+ "anchor_path": "ckpt/anchors_in256.pt"
 }

@@ -219,3 +219,80 @@ def robust_real_score(teacher, x, sigma, y, real_batch, est, cfg=1.0,
     v = lam_a.reshape(-1, 1, 1, 1)
     out[idx] = v * A[idx] + (1 - v) * Bf
     return out, lam
+
+
+class LambdaProbe:
+    """Diagnostic-only lambda statistic, evaluable at ARBITRARY points.
+
+    FINDINGS.md 1.2 argued that DMD2's real-data term corrects the teacher *off
+    the data manifold* rather than on it, and 3.1 turned that into a falsifiable
+    prediction: lambda should drift toward 1 at student samples as the student
+    converges onto the manifold. Confirming it is what separates "we tuned a
+    weight automatically" from "we identified what the real-data term does".
+
+    The shipped estimator (`LambdaEstimator.calibrate`, mode='dsm') cannot make
+    that measurement: it needs `g = -eps/sigma` on *held-out real* data to be an
+    unbiased draw of the true score, and there is no such quantity at a student
+    sample. So this probe uses the ratio statistic instead,
+
+        lam_ratio = V_B / E||A - B||^2,
+
+    which needs no ground truth and is therefore computable anywhere. Two
+    caveats, both load-bearing when reading the plot:
+
+      * it is a LOWER BOUND on lambda*, because it drops the <b_B, u> term
+        (LOG.log ENTRY 001), and the bound is loosest at small sigma;
+      * it is therefore NOT comparable to the lambda used in training.
+
+    What it *is* comparable to is itself, at the same step, at a different point
+    set. Real-vs-student at matched sigma and matched batch, tracked over
+    training, is the drift measurement -- and every term that makes the bound
+    loose is common to both legs.
+
+    Never feeds training. Accumulates plain means, not an EMA, and is reset
+    between probes so each logged curve is a snapshot rather than a smear.
+    """
+
+    def __init__(self, n_bins=16, sigma_min=0.002, sigma_max=200.0, device="cpu"):
+        self.n = n_bins
+        self.lo = torch.log(torch.tensor(sigma_min))
+        self.hi = torch.log(torch.tensor(sigma_max))
+        self.dev = device
+        self.reset()
+
+    def reset(self):
+        z = lambda: torch.zeros(self.n, device=self.dev)
+        self.vb, self.d2, self.sn, self.cnt = z(), z(), z(), z()
+
+    def bucket(self, sigma):
+        u = (sigma.log() - self.lo.to(sigma)) / (self.hi - self.lo).to(sigma)
+        return (u * self.n).long().clamp(0, self.n - 1)
+
+    @torch.no_grad()
+    def observe(self, teacher, x, y, sigma, real_batch, cfg=1.0):
+        """Accumulate the statistic at points `x` (already at noise `sigma`)."""
+        h = real_batch.shape[0] // 2
+        if h < 2:
+            return
+        A = teacher.cfg_score(x, sigma, y, scale=cfg)
+        Bf = empirical_score(x, real_batch, sigma)
+        B1 = empirical_score(x, real_batch[:h], sigma)
+        B2 = empirical_score(x, real_batch[h:], sigma)
+        f = lambda t: t.reshape(t.shape[0], -1).float()
+        v = (f(B1) - f(B2)).pow(2).sum(-1) / 4.0
+        d = (f(A) - f(Bf)).pow(2).sum(-1)
+        s = f(A).pow(2).sum(-1)
+        b = self.bucket(sigma)
+        for src, dst in ((v, self.vb), (d, self.d2), (s, self.sn)):
+            dst.index_add_(0, b, src)
+        self.cnt.index_add_(0, b, torch.ones_like(v))
+
+    @torch.no_grad()
+    def curve(self, min_count=8):
+        """(sigma, lam_ratio, var_B/||A||^2, count), NaN where under-sampled."""
+        s = torch.exp(self.lo + (torch.arange(self.n) + 0.5) / self.n * (self.hi - self.lo))
+        ok = self.cnt >= min_count
+        nan = torch.full_like(self.vb, float("nan"))
+        lam = torch.where(ok, self.vb / self.d2.clamp_min(1e-20), nan).clamp(0.0, 1.0)
+        vrel = torch.where(ok, self.vb / self.sn.clamp_min(1e-20), nan)
+        return s, lam.cpu(), vrel.cpu(), self.cnt.cpu()
