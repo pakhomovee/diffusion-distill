@@ -1,156 +1,289 @@
-# Run plan — GPU allocation for the distillation experiments
+# Run plan — the cheap programme, on RTX 4090s
 
-Target hardware: **NVIDIA RTX 5090, 32 GiB GDDR7, no NVLink (PCIe 5.0 x16 only).**
+Target hardware: **NVIDIA RTX 4090, 24 GiB, 1–4 cards depending on phase.**
+No NVLink (PCIe only), so DDP with full local replicas everywhere.
 
-> **This document budgets the ~5,000 GPU-hour ImageNet-256/512 programme, which
-> is NOT what we are running first.** `FINDINGS.md` §6 replaces it with a
-> ~230–455 GPU-hour cheap tier (CIFAR-10 at 3,072 dims, ImageNet-64 at 12,288,
-> a self-trained SiT latent leg at 4,096) that preserves the 4× dimension ladder
-> while cutting teacher parameters 19×. Come back here when the cheap tier says
-> the effect is real. The numbers below stay valid for that decision.
+> **Scope: the cheap tier only.** FINDINGS.md §6 / LOG.log ENTRY 013 replace the
+> ~5,000 GPU-hour ImageNet-256/512 programme with a ~130–200 GPU-hour one that
+> keeps the dimension ladder (3,072 → 12,288 trained, → 16,384 measured) while
+> cutting teacher parameters 19×. **That is the whole plan now.** The deferred
+> DiT-XL programme is preserved in §7 and is not scheduled; it becomes live only
+> if Phase A's held-out gain and Phase C/D's seeded FIDs both come out positive.
 
-> **The teacher is DiT-XL/2 for every run** (FINDINGS.md §4.0.1, decided in
-> favour of option 1). That makes the ladder XL@256 vs XL@512 rather than
-> DiT-B/2, so the DiT-B rows below are only reachable if we ever pretrain our own
-> teacher. The XL@512 leg is the 5.5-day row, and it is the real price of the
-> decision. Launchers and configs for the XL path are in `scripts/`.
->
-> The released checkpoints are **VP** models, not EDM ones; `ddgpu/vp.py` handles
-> the change of variables and `sigma_max` is **157.4**, not 80. See LOG.log
-> ENTRY 012 before changing anything about noise schedules.
+> The four teachers span **four preconditioning families** (VP ε, EDM denoiser,
+> linear interpolant velocity, and the synthetic self-test). A mismatch between
+> a family and its checkpoint raises **no exception** — LOG.log ENTRY 012 is the
+> story of exactly that — so `validate_teacher` runs before every run and every
+> λ measurement. See §6.
 
-All numbers below are **derived**, not quoted: parameter counts come from
-instantiating `ddgpu/dit.py` on the meta device, memory from `ddgpu/memcalc.py`,
-wall-clock from a FLOP model at 38% MFU. Regenerate with `python exp/plan_gpus.py`.
+Ordered commands from a bare box to Phase E: **[`RUNBOOK.md`](RUNBOOK.md)**,
+which carries the GPU count for every individual step.
 
-> **Before launching anything, run `python -m ddgpu.probe --sweep` on one card.**
-> The activation-memory term is analytic and is the one number here I cannot
-> validate without a GPU. The probe measures real `max_memory_allocated` and real
-> step time; if it disagrees with the table, the probe wins and the GPU counts
-> below should be recomputed.
+---
 
-## Two constraints that shape every choice
+## 0. What has actually been measured
 
-**1. 32 GiB, not 80 GiB.** DMD-style training holds three copies of the backbone
-(student, fake-score critic, frozen teacher). With fp32 Adam that is 16 bytes per
-parameter per trainable copy. The breakpoints:
+`scripts/smoke.sh --gpu` on one RTX 4090 — full output in
+`results/probe_4090_smoke.txt`. All three test suites pass, both tracks and both
+cheap-tier arms train, and the Phase A self-test recovers λ* on a target whose
+score is known (`gain_vs_teacher` 0.15 at σ=8, λ̂ 0.42 vs grid argmin 0.40).
 
-| trainable copies | max params/model at 32 GiB | fits? |
+The probe's memory rows, measured on the 4090:
+
+```
+DiT-B/2   res 32  dmd2        micro 128  ->  7.07 GiB   0.83 s/step
+DiT-B/2   res 64  dmd2        micro 128  -> 18.49 GiB   3.51 s/step
+DiT-B/2   res 64  invertible  micro 128  ->  OOM
+DiT-XL/2  every res, every method, micro 8..128  ->  OOM
+```
+
+`ddgpu.probe` only builds DiT backbones, so **it cannot measure the cheap tier's
+UNets**. Everything in §2 below is exact for optimiser state and *unmeasured*
+for activations; §5 says how to close that gap in twenty steps.
+
+---
+
+## 1. GPU count is set by the batch floor, not by VRAM
+
+FINDINGS §1.4, measured across 234 cells: with an effective real batch of
+**N=64** the doubly-robust fusion is *worse* than the plain teacher — mean MSE
+ratio 1.14, worst case **5.7×**, and every one of the five worst cells in the
+sweep is an N=64 cell. At N=256 the mean is 0.91 and the worst 1.15.
+
+`robust.py:all_gather_batch` gathers the real batch across ranks, so the
+effective N is `world_size × micro_batch`, and `scripts/lib/common.sh` refuses
+to launch below 256. That single inequality determines every GPU count in §3:
+
+```
+world_size × micro_batch ≥ 256          hard, launcher refuses below it
+world_size × micro_batch ≥ 512          soft, warning only
+```
+
+The second line is a *different threshold on a different quantity*:
+`LambdaEstimator.calibrate` splits the gathered batch — half supplies
+calibration points, half supplies `B` — so the calibration leg's empirical score
+sees `eff/2`. Below 256 there, calibration measures the optimal weight for a
+worse `B` than training actually uses, which biases λ toward the teacher.
+Conservative rather than catastrophic, hence a warning (FINDINGS §5).
+
+**Consequence for renting**: more cards buys correctness, a bigger card does
+not. A 24 GiB card at micro 256 and a 48 GiB card at micro 512 both satisfy the
+floor on one GPU; four 24 GiB cards at micro 64 satisfy it at a quarter the
+activation memory each. That is why the plan is 4×4090 and not 1×anything.
+
+---
+
+## 2. What fits in 24 GiB
+
+Optimiser state is exact arithmetic, not a model. Per trainable copy fp32 Adam
+is 16 B/param (params + grads + m + v); the EMA shadow is a fp32 `deepcopy` of
+the student (4 B/param, always on — `ema_decay` defaults to 0.999); the frozen
+teacher is loaded fp32 and run under bf16 autocast (`ddgpu/teachers.py` never
+casts the weights), so 4 B/param:
+
+```
+state = 2 × 16 B/param   (student + critic)
+      +     4 B/param    (EMA shadow)
+      +     4 B/param    (frozen teacher)
+      = 40 B/param
+```
+
+| arm | teacher | params | state | free on a 24 GiB card |
+|---|---|---:|---:|---:|
+| C · CIFAR-10 32px pixel | `diffusers:google/ddpm-cifar10-32` | 35.7 M | **1.33 GiB** | ~20.7 GiB |
+| D · ImageNet-64 pixel | `edm:...-cond-adm.pkl` | 295.9 M | **11.02 GiB** | ~11.0 GiB |
+| E · IN-100 256px latent | `sit:...0300000.pt` | 130.0 M | **4.84 GiB** | ~17.2 GiB |
+| A · λ ladder, any leg | any | — | forward only, no optimiser | ~21 GiB |
+| *(deferred)* DiT-XL/2 | `dit:DiT-XL-2-*.pt` | 674.8 M | **25.14 GiB** | **−3.1 GiB** |
+
+The last row is why the probe OOMed on DiT-XL/2 at micro 8: it does not run out
+of room for activations, it runs out of room for the *weights*. Nothing about
+micro-batch can fix that.
+
+The `dmd2` arm additionally trains a ~3 M-parameter `gan.ConvGANHead`
+discriminator (~0.05 GiB of state). The `robust` arm has none — that is the
+claim being tested — so the method arm is, if anything, the cheaper one.
+
+**What is not in the table: activations.** The cheap tier's students and critics
+are `deepcopy` clones of a UNet teacher (`train.clone_trainable`), and **the
+clone path carries no gradient checkpointing** — `grad_ckpt` is a `ddgpu/dit.py`
+option and these are not DiTs. So activation memory is whatever the third-party
+UNet does at the chosen micro-batch, unmeasured, and Phase D is the one arm
+where 11 GiB of state plus that unknown could plausibly exceed 24 GiB. §5.
+
+---
+
+## 3. Per-phase allocation
+
+Wall-clock is an **estimate** — FLOP model at 165 TFLOP/s peak bf16, MFU 0.30
+for the UNets and 0.35 for the SiT, `STEP_COST["dmd2"] = 11` forward-equivalents
+per step (`ddgpu/memcalc.py`). Replace it with the measured `s_per_it` the
+trainer prints; see §5.
+
+| phase | what | GPUs | micro | effective N | state/GPU | est. wall-clock | est. GPU-h |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **A** | λ ladder, all legs, inference only | **1** | batch 512 | — | <2 GiB | ~2 h total | ~2–4 |
+| **C** | CIFAR-10 `dmd2` vs `robust`, 3 seeds each (6 runs) | **1 per run**, 4 in parallel | 512 | 512 | 1.3 GiB | ~3.8 h/run → ~8 h in 2 waves | ~23 |
+| **D** | ImageNet-64 pair (2 runs) | **4** | 64 | 256 | 11.0 GiB | ~8 h/run → ~16 h | ~65 |
+| **E** | IN-100 latent pair (2 runs) | **4** | 64 | 256 | 4.8 GiB | ~3 h/run → ~6 h | ~25 |
+| — | prep, teacher fetch, evals, figures | 1–4 | — | — | — | ~4 h | ~10 |
+| | | | | | | **~1.5 days** | **~130** |
+
+FINDINGS §6.3's envelope for the same programme is 230–455 GPU-h. The gap is
+MFU optimism on my side versus deliberate conservatism on theirs; treat 130 as
+the floor and 455 as the ceiling, and let the first measured `s_per_it` decide
+which end you are at. Either way it is 10–35× under the deferred §7 plan.
+
+**Phase C parallelism.** Six single-GPU runs on a 4-card box is two waves of
+4 + 2, each run launched with its own `--gpus <id>`. `torchrun --standalone`
+rendezvouses on `localhost:0` — a random free port — so concurrent launches do
+not collide, and `MASTER_PORT` does not need setting. RUNPLAN's old warning
+against co-locating runs still stands and is different: it is about *two runs
+per card*, which halves the usable micro-batch and breaks the batch floor.
+
+**Phase D fallback.** If micro 64 OOMs on 24 GiB, go to **8×4090 at micro 32**
+(8 × 32 = 256, floor still met, half the activations per card). Do *not* go to
+2 GPUs at micro 128 — that raises per-card activations rather than lowering
+them. Do *not* set `DD_ALLOW_SMALL_REAL_BATCH=1`; that converts the run into the
+`nogather` ablation.
+
+**Track B is not in this programme.** The cheap tier is Track A only
+(FINDINGS §6.3). If you want a cheap Track B signal, `-d cifar10 --mode invert`
+on **1 GPU** is the fastest way to reach its kill criterion: watch
+`DIAG eff_rank_frac` in the first 500 steps, and if it falls away from 1.0 the
+encoder is collapsing onto a subspace and the run is dead (FINDINGS §3.3,
+LOG ENTRY 004). The loss curves will not tell you this.
+
+---
+
+## 4. Sequencing and gates
+
+**Do not launch a phase until the previous gate passes.**
+
+| # | phase | gate to clear before the next |
 |---|---|---|
-| 2 (DMD2: student + critic) | ~850 M | DiT-XL/2 (675 M) fits with 8.6 GiB to spare |
-| 2 (Track B: student + encoder) | ~850 M | same — **E replaces the critic, it does not add to it** |
-| 3 (any variant keeping both) | ~560 M | DiT-XL/2 **does not fit** — 31.4 GiB of state alone |
-| 2, LoRA r=64 + shared base | ~10 B | SDXL (2.6 B) fits with 23.6 GiB free |
+| 0 | `scripts/smoke.sh --gpu`, teacher validation | every `verdict` is `OK`; `rel_mse` ≈0 at small σ rising toward 1 at large σ |
+| 1 | **A** — λ ladder | `gain_vs_teacher < 1.0` at CIFAR's 3,072 dims. **If not, stop.** That is a real negative result for one GPU-hour |
+| 2 | **C** — CIFAR pair, 3 seeds | read the *seed-grouped* table. A gap inside one standard error is "no measured difference", not a win |
+| 3 | **D** — ImageNet-64 pair | does the effect survive 4× the dimension? This is the rung that makes the ladder credible, and it is required, not optional |
+| 4 | **E** — IN-100 latent pair | does it hold in latent space, with a deliberately weaker teacher? λ should sit *lower* if λ is driven by teacher bias |
+| 5 | decide on §7 | only if A and C/D are both positive |
 
-Track B is critic-free by construction: the fake-score network is replaced by a
-closed-form discrepancy against N(0,I), and the encoder E occupies the slot the
-critic used to. So Track B and the DMD2 baseline have **the same VRAM footprint**
-and can be compared without a memory confound. If you ever add a critic *back*
-alongside E, you land in row 3 and DiT-XL stops fitting — reach for 8-bit Adam
-(10 B/param → 20.1 GiB) or ZeRO-2 (optimizer-state sharding only, which avoids
-the per-layer all-gather traffic that makes full FSDP bad on PCIe).
+Phase A's ladder legs beyond CIFAR (ImageNet-64, DiT@512, SiT) need their
+datasets prepared, so in practice they run alongside phases D and E rather than
+all up front. The CIFAR leg is the gate and it needs nothing but CIFAR-10.
 
-**2. No NVLink.** This is an architecture decision, not a footnote. FSDP
-all-gathers parameters every layer; over PCIe 5.0 (~50 GB/s effective, versus
-900 GB/s NVLink) that dominates the step. **Use DDP with full local replicas
-wherever the replicas fit** — which, per the table above, is everywhere in the
-ImageNet ladder. Reach for ZeRO-2 before ZeRO-3, and full FSDP only for SDXL.
+**Phase A cannot produce the mechanism result.** `LambdaEstimator.calibrate`
+evaluates at noised *real* data, and the DSM identity does not extend to student
+samples — `g = −ε/σ` is unbiased for the score of whatever distribution `x0` came
+from. §1.2/§3.1's drift claim needs a student, i.e. Phase C, where `probe_every`
+logs `PROBE real:lam@med` against `student:lam@med` for free.
 
-## Per-run allocation
+---
 
-```
-======================================================================================================================
-RUN PLAN  --  per-run GPU counts (RTX 5090 32GiB, DDP, grad ckpt, bf16 autocast)
-======================================================================================================================
+## 5. The one number this plan cannot derive, and how to get it
 
--- L1/L2 dimension ladder: same arch, same data, 4096 vs 16384 dims (the controlled ablation) --
-DMD2 baseline   DiT-B/2 @256px (4096-d)               2x5090  state   4.1G  micro 128x1   1.64s/step    22.8 h  (0.9 d)
-DMD2 baseline   DiT-B/2 @512px (16384-d)              4x5090  state   4.1G  micro  64x1   3.78s/step    52.5 h  (2.2 d)
-Track A robust  DiT-B/2 @256px                        2x5090  state   4.1G  micro 128x1   1.64s/step    22.8 h  (0.9 d)
-Track A robust  DiT-B/2 @512px                        4x5090  state   4.1G  micro  64x1   3.78s/step    52.5 h  (2.2 d)
+Activation memory and step time for third-party UNets. `ddgpu.probe` builds DiTs
+only, and `memcalc`'s activation model is transformer-shaped — FINDINGS §6.3
+says so explicitly about exactly these estimates.
 
--- L3 headline ImageNet number --
-DMD2 baseline   DiT-XL/2 @256px                       8x5090  state  21.4G  micro  32x1   2.28s/step    31.6 h  (1.3 d)
-Track A robust  DiT-XL/2 @256px                       8x5090  state  21.4G  micro  32x1   2.28s/step    31.6 h  (1.3 d)
-DMD2 baseline   DiT-XL/2 @512px                       8x5090  state  16.3G  micro  32x1   9.44s/step   131.1 h  (5.5 d)
+Twenty steps settles both, per arm, before committing hours:
 
--- Track B (invertible): E REPLACES the fake-score critic, so still 2 trainable nets --
-Track B invert  DiT-B/2 @256px                        2x5090  state   4.1G  micro 128x1   2.82s/step    39.1 h  (1.6 d)
-Track B invert  DiT-B/2 @512px                        4x5090  state   4.1G  micro  64x1   6.51s/step    90.4 h  (3.8 d)
-Track B invert  DiT-XL/2 @256px                       8x5090  state  21.4G  micro  32x1   3.80s/step    52.7 h  (2.2 d)
-
--- Track B preprocessing: teacher-anchor cache (one-off, reusable across runs) --
-  anchors DiT-B/2 @32: 50k pairs x 32 steps -> 146.89 PFLOP,  1.02 h on 1 GPU
-  anchors DiT-B/2 @32: 50k pairs x 32 steps -> 146.89 PFLOP,  0.13 h on 8 GPU
-  anchors DiT-B/2 @64: 50k pairs x 32 steps -> 680.32 PFLOP,  4.74 h on 1 GPU
-  anchors DiT-B/2 @64: 50k pairs x 32 steps -> 680.32 PFLOP,  0.59 h on 8 GPU
-  anchors DiT-XL/2 @32: 50k pairs x 32 steps -> 757.63 PFLOP,  5.27 h on 1 GPU
-  anchors DiT-XL/2 @32: 50k pairs x 32 steps -> 757.63 PFLOP,  0.66 h on 8 GPU
+```bash
+scripts/train.sh -d imagenet64 --mode robust --gpus 0,1,2,3 --steps 20
+nvidia-smi --query-gpu=memory.used --format=csv    # from a second shell
 ```
 
-## Text-to-image tier (only if the ImageNet ladder says the method survives)
+The trainer prints `s_per_it` on every log line and accumulates `gpu_hours`, so
+after twenty steps:
 
-| config | GPUs | state | micro×accum | note |
-|---|---|---|---|---|
-| SDXL-UNet 1024px, full finetune | — | 81.3 GiB | — | **impossible on 32 GiB, at any count** |
-| SDXL-UNet 1024px, LoRA r=64 attn-only, shared base | 8×5090 | 6.4 GiB | 8×1 | 14/GPU ceiling |
-| SDXL-UNet 1024px, LoRA r=64 attn+FF, shared base | 8×5090 | 9.8 GiB | 8×1 | 12/GPU ceiling — use this number, it is the pessimistic end |
-| PixArt-Σ 0.6B 1024px | 4×5090 | 19.3 GiB | 8×2 | **SDXL's latent dim at ¼ the params — the right dimension probe** |
+```
+wall-clock hours = steps × s_per_it / 3600
+```
 
-The shared-frozen-base trick is what makes SDXL tractable here: teacher, student
-and critic are the *same* 2.6 B bf16 weights with three swappable LoRA adapters,
-so we pay 4.8 GiB once instead of 14.3 GiB three times. Implemented in
-`ddgpu/lora.py` (`AdapterSet`), unit-tested for adapter isolation — perturbing
-the student adapter provably leaves the critic and the teacher untouched — but
-**not yet run against a real SDXL UNet**; the target-name patterns are generic
-and should be spot-checked against SDXL's block naming before the first run.
+If that disagrees with §3, **the measurement wins** and §3 should be corrected in
+place. This is the same rule the old plan applied to `ddgpu.probe`, and it is the
+reason the smoke script exists.
 
-## What each run buys
+---
 
-Per-run scientific justification, decision gates and kill criteria live in
-**`FINDINGS.md` §4**. Short version: Run 1 validates the harness and produces the
-paper's first figure; Run 2 is the controlled dimension ablation (4096 → 16384
-dims at fixed parameters) and is the highest-information run in the plan; Run 3
-varies parameters at fixed dimension, so together with Run 2 it separates the two
-axes; Run 4 tests Track B in the cheapest configuration that can fail fast.
+## 6. Things that will bite
 
-**Do not launch a run until the previous gate passes.**
+- **A teacher wrapped in the wrong preconditioning raises nothing.** Four
+  families share one trainer (VP ε, EDM denoiser, interpolant velocity,
+  synthetic). `validate_teacher` is what notices: `rel_mse` should be ~0 at
+  small σ and rise toward 1 at large σ; **flat and near 1 everywhere means the
+  network is being evaluated at a noise level unrelated to the one applied**.
+  `ddgpu.train` refuses to start on `SUSPECT`. LOG ENTRY 012.
+- **σ_max is per-family and it is not 80.** VP teachers (`diffusers` DDPM, DiT)
+  top out at **157.4**; EDM at 80; the SiT interpolant near 49. A one-step
+  student starting at the wrong σ_max begins half way up a schedule it was
+  initialised from, and nothing errors. `exp/10_lambda_real.py` defaults to 80,
+  so **pass `--sigma-max` explicitly** and cross-check it against the teacher
+  meta printed at startup.
+- **FID at matched wall-clock, not matched steps.** `ddgpu.eval` raises rather
+  than print a table when runs differ by more than `--tol` (15%) in GPU-seconds.
+  That refusal is the guard working.
+- **Precision and recall alongside FID, always.** Mode-seeking objectives buy
+  FID with diversity and that trade hides inside a single number.
+- **Three seeds is not optional at CIFAR scale.** One-step CIFAR distillation is
+  near-saturated (published FIDs ~2–4); the effect may be smaller than
+  run-to-run variance, and one run per arm cannot tell the two apart.
+  `ddgpu.eval --seeds` refuses to call a win inside one standard error, or with
+  fewer than 3 seeds per arm.
+- **The cheap tier's baseline FID is ours, not a reproduction.** Its teachers
+  expose no token trunk, so the discriminator is a standalone `ConvGANHead`
+  rather than DMD2's critic-feature head. Both arms use the identical head and
+  the method arm uses none, so *our* comparison stands — the absolute number is
+  not comparable to DMD2's published one.
+- **Resuming.** `--resume` restores the student, EMA, critic and the accumulated
+  **GPU-seconds**, which matters because the eval harness compares on
+  GPU-seconds and a resumed run that forgot its history looks artificially cheap.
 
-## Recommended allocation
+---
 
-**One 8×5090 node.** That covers every run in the table, with the two 2-GPU
-ladder runs packing 4-at-a-time onto the node.
+## 7. Deferred: the ImageNet-256/512 programme
 
-Sequenced, assuming the node is exclusive:
+Not scheduled. Kept because if the cheap tier's gates pass, this is what the
+result justifies spending, and the pipeline for it is already built and tested.
 
-| phase | runs | GPUs used | wall-clock |
-|---|---|---|---|
-| 0. probe + harness validation | `ddgpu.probe --sweep`, toy CPU sweeps | 1 | ~1 h |
-| 1. DMD2 baseline reproduction @256 | 1 run | 2 | ~1 d |
-| 2. dimension ladder (4 runs: {baseline,robust} × {256,512}) | 4 runs | 2+2+4+4 = 12 → 2 waves | ~4 d |
-| 3. headline DiT-XL/2 @256 (baseline + robust) | 2 runs | 8 each, serial | ~3 d |
-| 4. Track B invertible @256 (+ ablations) | 3 runs | 2 each, parallel | ~2 d |
-| 5. contingency / reruns | — | — | ~4 d |
+**It needs ≥32 GiB cards, and more of them than the old table admitted.** The
+original arithmetic here counted two trainable copies plus a bf16 frozen teacher
+= 21.4 GiB for DiT-XL/2, and concluded a 32 GiB 5090 fits "with 8.6 GiB to
+spare". The shipped code also keeps an fp32 EMA shadow and an fp32 teacher, so
+the real figure is **25.14 GiB** (§2) and the spare on a 5090 is ~4.9 GiB of a
+~30 GiB usable budget, at micro 32 with grad checkpointing on. That is not
+impossible — DiT *does* get gradient checkpointing — but it is tight, and it
+should be re-probed on the actual card before anyone books a node. On 24 GiB it
+is arithmetically impossible, which the 4090 probe confirmed at every
+micro-batch.
 
-**≈ 2 weeks on one 8×5090 node** for the full ImageNet story.
-Add ~1 week and the same node for the SDXL LoRA tier if phase 2–3 justify it.
+The rest of the old plan stands as written: 8×5090 for one node,
+`{baseline, robust} × {256, 512}` as the controlled dimension ladder at fixed
+parameters, DiT-XL/2 @256 as the headline pair, Track B invertible @256 as the
+cheapest configuration that can fail fast, ~2 weeks of node time, and an SDXL
+LoRA tier behind it (`ddgpu/lora.py`'s `AdapterSet` is unit-tested for adapter
+isolation but has never met a real SDXL UNet). Regenerate its table with:
 
-## Things that will bite
+```bash
+python exp/plan_gpus.py       # RTX 5090 assumptions, DiT backbones
+```
 
-- **Two runs per card is a trap.** The micro-batch numbers assume exclusive
-  access. Co-locating two runs on one 5090 halves the micro-batch and the
-  activation model stops holding.
-- **`torch.compile`** on a 5090 needs CUDA 12.8+ / PyTorch ≥ 2.7 for sm_120.
-  Worth ~20–30% but compile it *after* the probe, not before, or the memory
-  numbers shift under you.
-- **Grad checkpointing is assumed on.** Turning it off raises the micro-batch
-  ceiling by roughly 12× less memory headroom — i.e. it collapses.
-- **FID must be at matched wall-clock**, not matched steps (info.txt's warning).
-  Track A and Track B have different per-step costs (11 vs 19 fwd-equivalents),
-  so equal-step comparisons systematically favour Track B. Report precision and
-  recall separately as well; mode-seeking objectives buy FID with diversity.
+Two structural facts from it that outlive the deferral:
 
-## Track A has no tuned λ hyperparameter (as of the DSM calibrator)
+- **Track B is critic-free by construction** — the encoder E *replaces* the
+  fake-score network rather than adding to it, so Track B and the DMD2 baseline
+  have the same VRAM footprint and can be compared without a memory confound.
+  Add a critic back alongside E and you land on three trainable copies, where
+  DiT-XL/2 stops fitting on any consumer card.
+- **No NVLink is an architecture decision, not a footnote.** FSDP all-gathers
+  parameters every layer; over PCIe (~50 GB/s effective versus 900 GB/s NVLink)
+  that dominates the step. Use DDP with full local replicas wherever they fit,
+  reach for ZeRO-2 before ZeRO-3, and full FSDP only for SDXL.
+
+---
+
+## 8. Track A has no tuned λ hyperparameter
 
 The λ weight is the minimiser of a **held-out denoising loss**, computed online:
 
@@ -172,37 +305,22 @@ real batch supplies calibration points, the other half supplies `B`. If they
 overlap, `B` has seen the sample it is being scored against and memorises it,
 biasing the calibration in exactly the direction the method is about.
 
-## Hard precondition for Track A: effective real batch ≥ 256
+---
 
-Measured across 234 cells (exp04): with a real batch of **N=64** the doubly-robust
-fusion is *worse* than the plain teacher — mean ratio 1.14, worst case **5.7×**.
-Every one of the five worst cells in the whole sweep is an N=64 cell. At N=256 the
-mean is 0.91 and the worst 1.15.
-
-The per-device micro-batch in the table above is 32–128, so a naive implementation
-sits **inside the failure regime**. `ddgpu/robust.py:all_gather_batch` gathers the
-real batch across ranks, which takes N to `world_size × micro` — 8×32 = 256, the
-first safe row. This is a correctness requirement, not an optimisation:
-
-- **Never run Track A on fewer GPUs than `256 / micro_batch`**, or raise the micro
-  batch to compensate.
-- `gather_real` defaults to `true`; setting it false is an ablation, not a config.
-
-## Sanity checks to run before each long job
+## 9. Sanity checks to run before each long job
 
 ```bash
 scripts/smoke.sh --gpu      # invariant tests + both tracks + the VRAM/throughput probe
 ```
 
-That is all three of the old commands plus `tests/test_pipeline.py`, in order,
-failing fast. On a fresh box also run the teacher fetch once, because it is the
-first thing that verifies the released weights against our DiT:
+Tests, both tracks, both cheap-tier arms and the Phase A self-test, in order,
+failing fast. On a fresh box also validate every teacher you are about to trust,
+because that is the check with no exception behind it:
 
 ```bash
-python3 -m ddgpu.ckpt --name DiT-XL-2-256x256 --dir ckpt
+python3 -m ddgpu.teachers --teacher diffusers:google/ddpm-cifar10-32 --data data/cifar10
 ```
 
-For Track B specifically, watch `DIAG eff_rank_frac` in the first 500 steps. It
-should sit near 1.0. If it falls, the encoder is collapsing onto a subspace and
-the run is dead — the loss curves will *not* tell you this. See LOG.log ENTRY 004
-for the version of this failure that was already caught and fixed.
+```
+{"rel_mse@0.01": 0.0004, ..., "identity_err": 1.6e-11, "monotone": true, "verdict": "OK"}
+```
