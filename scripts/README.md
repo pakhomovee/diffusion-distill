@@ -108,6 +108,13 @@ python3 -m ddgpu.prepare refstats --source $IMAGENET_SRC --dest data/in256 \
     --resolution 256 --n 50000 --gpus 0,1,2,3,4,5,6,7
 ```
 
+For CIFAR-10, `--source cifar10` goes through torchvision. It does **not**
+re-download a tarball you already have: `prepare.TorchvisionImages.find_root`
+checks `$DD_DATA_ROOT`, then `<repo>/data`, then `~/.cache/dd-data` for either
+`cifar-10-python.tar.gz` or an extracted `cifar-10-batches-py`, uses the first
+hit, and prints which. `$DD_TV_ROOT` short-circuits that search and also
+redirects the download when the file is genuinely absent.
+
 `latents` writes an (N, 8, H/8, W/8) fp16 memmap of SD-VAE **moments** — the
 latent is resampled every read, as DiT trains — plus `meta.json` carrying the
 **measured** `sigma_data`. Disk: ~21 GB for ImageNet-256, ~84 GB for 512.

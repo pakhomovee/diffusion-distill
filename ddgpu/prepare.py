@@ -94,12 +94,53 @@ class TorchvisionImages(torch.utils.data.Dataset):
     Only used for the small standard benchmarks (CIFAR-10) where downloading
     through torchvision is far less friction than staging an image folder.
     Images come out in [-1, 1], the same convention as `ImageFolderFlat`.
-    """
-    SETS = {"cifar10": ("CIFAR10", 10), "cifar100": ("CIFAR100", 100)}
 
-    def __init__(self, name, resolution, root="~/.cache/dd-data", train=True):
+    The root is *discovered* rather than fixed, because a box that has already
+    fetched the tarball once should not fetch it again: see `find_root`.
+    """
+    # name: (torchvision class, n_classes, archive name, extracted folder)
+    SETS = {"cifar10":  ("CIFAR10", 10, "cifar-10-python.tar.gz", "cifar-10-batches-py"),
+            "cifar100": ("CIFAR100", 100, "cifar-100-python.tar.gz", "cifar-100-python")}
+    DEFAULT_ROOT = "~/.cache/dd-data"
+
+    @classmethod
+    def find_root(cls, name):
+        """First candidate root that already holds this dataset; else the default.
+
+        torchvision downloads to `root` and skips the download when the archive
+        (md5-checked) or the extracted folder is already there. So the only thing
+        standing between "already have it" and "fetch 170 MB again" is pointing
+        `root` at the right directory -- and the right directory differs per box.
+        Checked in order, first hit wins:
+
+            $DD_DATA_ROOT    the data volume the rest of the pipeline uses
+            <repo>/data      the in-repo default when DD_DATA_ROOT is unset
+            ~/.cache/dd-data where we download to when nobody has it yet
+
+        `$DD_TV_ROOT` short-circuits the search entirely and is used whether or
+        not the data is there yet, so that setting it also redirects the
+        download. The rest are searched, not assumed.
+        """
+        _, _, archive, folder = cls.SETS[name]
+        if os.environ.get("DD_TV_ROOT"):
+            return os.path.expanduser(os.environ["DD_TV_ROOT"])
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cands = [os.environ.get("DD_DATA_ROOT"),
+                 os.path.join(repo, "data"), cls.DEFAULT_ROOT]
+        for c in cands:
+            if not c:
+                continue
+            c = os.path.expanduser(c)
+            if os.path.exists(os.path.join(c, archive)) or \
+               os.path.isdir(os.path.join(c, folder)):
+                print(f"[prepare] {name}: using existing data in {c}")
+                return c
+        return os.path.expanduser(cls.DEFAULT_ROOT)
+
+    def __init__(self, name, resolution, root=None, train=True):
         import torchvision
-        cls, ncls = self.SETS[name]
+        cls, ncls = self.SETS[name][:2]
+        root = root or self.find_root(name)
         self.ds = getattr(torchvision.datasets, cls)(
             os.path.expanduser(root), train=train, download=True)
         self.res, self.n_classes = resolution, ncls

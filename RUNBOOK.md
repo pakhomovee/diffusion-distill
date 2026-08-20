@@ -105,7 +105,26 @@ python3 -m ddgpu.prepare refstats \
     --source cifar10 --dest "$DD_DATA_ROOT/cifar10" --resolution 32 --n 50000 --gpus 0
 ```
 
-~0.15 GB on disk. torchvision downloads CIFAR-10 to `~/.cache/dd-data` on first use.
+~0.15 GB on disk.
+
+**Already have `cifar-10-python.tar.gz`?** Nothing to do — `prepare` looks for it
+before downloading, checking `$DD_DATA_ROOT`, then `<repo>/data`, then
+`~/.cache/dd-data`, and uses the first that holds either the archive or an
+extracted `cifar-10-batches-py`. It prints which one it picked:
+
+```
+[prepare] cifar10: using existing data in /root/autodl-tmp/data
+```
+
+If the tarball lives somewhere else entirely, point at it explicitly — this also
+redirects the download when the file is *not* there:
+
+```bash
+export DD_TV_ROOT=/path/to/the/folder/holding/the/tarball
+```
+
+torchvision md5-checks the archive, so a corrupt or truncated copy is re-fetched
+rather than silently used.
 
 ### 2. Verify the CIFAR teacher — **GPUs: 1**
 
