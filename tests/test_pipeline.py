@@ -274,6 +274,82 @@ def t_lambda_probe():
           (pr.reset(), float(pr.cnt.sum()))[1] == 0.0)
 
 
+def t_vp_precision_at_sigma_max():
+    """A VP denoiser under bf16 autocast must still resolve x0 at sigma_max.
+
+    `D = x - sigma*eps` is a catastrophic cancellation: both terms are O(sigma),
+    the answer is O(sigma_data), so an error `d` in eps arrives in D as
+    sigma*d. bf16's ulp is 2^-7, and at CIFAR's sigma_max=157.4 with
+    sigma_data=0.5 that is rounding noise of std ~0.26 against a 0.5 signal --
+    SNR 2. A one-step student generates at sigma_max on EVERY sample, so it
+    cannot emit a clean image at all; the samples come out as recognisable
+    structure buried in speckle, and FID lands around 325 instead of single
+    digits. This cost a full 6-run CIFAR programme once.
+
+    The oracle returns the EXACT eps for a known target, in the autocast dtype
+    (which is what a real network's final conv does), so any error measured
+    here is the parameterisation's, not the network's.
+    """
+    from ddgpu.vp import VPSchedule, VPPrecond
+    sch, sd = VPSchedule(), 0.5
+
+    def ac_dtype():
+        try:
+            return torch.get_autocast_dtype("cpu") if torch.is_autocast_enabled("cpu") else None
+        except TypeError:                                   # older torch
+            return torch.get_autocast_cpu_dtype() if torch.is_autocast_enabled() else None
+
+    class Oracle(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.target = None
+
+        def forward(self, u, t, y, **kw):
+            sig = sch.sigma_of_t(t.double()).to(torch.float32).reshape(-1, 1, 1, 1)
+            out = (u.float() * (1 + sig ** 2).sqrt() - self.target) / sig
+            d = ac_dtype()
+            return out.to(d) if d is not None else out
+
+    g = torch.Generator().manual_seed(0)
+    target = torch.randn(32, 3, 32, 32, generator=g) * sd
+    x = torch.randn(32, 3, 32, 32, generator=g) * sch.sigma_max
+    s = torch.full((32,), sch.sigma_max)
+    y = torch.zeros(32, dtype=torch.long)
+
+    m = VPPrecond(Oracle(), sch, sigma_data=sd)
+    m.net.target = target
+    with torch.autocast("cpu", torch.bfloat16, enabled=True):
+        D = m(x, s, y)
+    err = (D.float() - target).std().item()
+    check("VP denoiser resolves x0 at sigma_max under bf16 autocast",
+          err < 0.02 * sd, f"noise std {err:.4f} vs image std {sd}")
+
+    # The guard must be what is doing it -- otherwise this test passes for the
+    # wrong reason on a build where autocast happens not to engage.
+    m.FP32_MARGIN = 1e9                                     # disable it
+    with torch.autocast("cpu", torch.bfloat16, enabled=True):
+        D_bad = m(x, s, y)
+    err_bad = (D_bad.float() - target).std().item()
+    check("...and without the guard it is genuinely broken",
+          err_bad > 0.2 * sd, f"noise std {err_bad:.4f} (SNR {sd / max(err_bad, 1e-9):.2f})")
+
+    # Low sigma must NOT pay for fp32: there is no cancellation there.
+    m.FP32_MARGIN = VPPrecond.FP32_MARGIN
+    check("low sigma stays in the fast path", not m._fp32_needed(torch.full((4,), 1.0)))
+    check("sigma_max takes the fp32 path", m._fp32_needed(s))
+
+    # EDM preconditioning is safe by construction: c_out -> sigma_data, so the
+    # network's contribution to D never gets amplified. Guarding it would only
+    # cost speed. Pin the property so nobody "fixes" EDM the same way.
+    from ddgpu.edm import EDMWrapper
+    sig = torch.tensor([0.1, 1.0, 80.0, 157.4, 1000.0])
+    e = EDMWrapper.__new__(EDMWrapper)
+    e.sigma_data = sd
+    _, c_out, _, _ = EDMWrapper._coef(e, sig)
+    check("EDM c_out is bounded by sigma_data (no amplification)",
+          bool((c_out.abs() <= sd + 1e-6).all()), f"max |c_out| {c_out.abs().max():.4f}")
+
+
 def t_fid_math():
     """FID must be right, and must survive scipy moving under us.
 
@@ -450,7 +526,8 @@ if __name__ == "__main__":
     for fn in (t_pos_embed_matches_official, t_vp_schedule_roundtrip,
                t_vp_precond_exact_on_gaussian, t_student_grid, t_sigma_sampler,
                t_checkpoint_remap, t_dataset_moments, t_config_delta, t_ema,
-               t_lambda_probe, t_fid_math, t_torchrun_flag_safety, t_pixel_eval_path):
+               t_lambda_probe, t_vp_precision_at_sigma_max, t_fid_math,
+               t_torchrun_flag_safety, t_pixel_eval_path):
         print(f"\n== {fn.__name__} ==")
         fn()
     print("\n" + ("ALL PASS" if not FAIL else f"{len(FAIL)} FAILED: {FAIL}"))

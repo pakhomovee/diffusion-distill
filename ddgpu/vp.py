@@ -162,9 +162,37 @@ class VPPrecond(nn.Module):
         out = self.net(v(ci) * x, cn, y, **kw)
         return out[:, :self.out_ch] if self.out_ch else out
 
+    # `D = x - sigma * eps` is a CATASTROPHIC CANCELLATION when sigma is large:
+    # both terms are O(sigma) and the answer is only O(sigma_data), so an error
+    # `d` in eps lands in D multiplied by sigma. Under bf16 autocast the network
+    # returns eps with ulp 2^-7, and at CIFAR's sigma_max=157.4 with
+    # sigma_data=0.5 that is rounding noise of std 0.26 against a 0.5 signal --
+    # SNR 2, an image buried in speckle. A one-step student generates at
+    # sigma_max on EVERY sample, so it cannot express a clean image at all.
+    #
+    # This is specific to the VP eps-parameterisation. EDM's c_out is
+    # sigma*sigma_data/sqrt(sigma^2+sigma_data^2) -> sigma_data and the
+    # interpolant's is -sigma/(1+sigma) -> -1; both keep the network's
+    # contribution O(1), which is what that preconditioning is FOR. Here c_out
+    # is an unnormalised -sigma, so the guard below has to do the same job.
+    #
+    # `score` needs no guard: it DIVIDES by sigma and shrinks the same error.
+    FP32_MARGIN = 0.05        # tolerated rounding noise, as a fraction of sigma_data
+
+    def _fp32_needed(self, sigma):
+        """Would low-precision eps put more than FP32_MARGIN*sigma_data into D?"""
+        ulp = torch.finfo(torch.bfloat16).eps      # the worst autocast may hand us
+        return float(sigma.max()) * ulp > self.FP32_MARGIN * self.sigma_data
+
     def forward(self, x, sigma, y, **kw):
         sigma = _as_batch(sigma, x)
-        return x - sigma.reshape(-1, 1, 1, 1) * self._eps(x, sigma, y, **kw)
+        if self._fp32_needed(sigma):
+            # A no-op when the caller was not autocasting in the first place.
+            with torch.autocast(x.device.type, enabled=False):
+                eps = self._eps(x.float(), sigma.float(), y, **kw)
+        else:
+            eps = self._eps(x, sigma, y, **kw)
+        return x - sigma.reshape(-1, 1, 1, 1) * eps
 
     def score(self, x, sigma, y, **kw):
         sigma = _as_batch(sigma, x)

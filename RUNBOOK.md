@@ -227,6 +227,22 @@ runs sharing a card halves the usable micro-batch and breaks the batch floor.
 Three seeds is not optional (FINDINGS §6.4): one-step CIFAR distillation is
 near-saturated and the effect may be smaller than seed variance.
 
+**Sanity-check the first run before launching the rest.** Kill one run at ~2000
+steps, score it cheaply, and look at the grid:
+
+```bash
+torchrun --standalone --nproc_per_node=1 -m ddgpu.generate \
+    --run-dir runs/cifar10_dmd2 --ckpt final --n-samples 2048 \
+    --ref "$DD_DATA_ROOT/cifar10/ref_32_50000.npz" \
+    --out results/probe.json --name probe
+```
+
+Open `runs/cifar10_dmd2/samples_final.png`. Structure buried in colour speckle
+means the σ_max precision problem is back (RUNPLAN §6, first bullet) — that
+signature cost a full six-run programme once. An FID in the hundreds with
+`recall` exactly 0.000 is the same thing seen numerically. Twenty minutes here
+saves five hours per arm.
+
 Serial equivalent on a 1-GPU box (~23 h):
 
 ```bash

@@ -209,6 +209,25 @@ reason the smoke script exists.
 
 ## 6. Things that will bite
 
+- **bf16 cannot express a VP one-step student's output at σ_max.** This one is
+  measured, not predicted: it destroyed the first CIFAR programme. The VP
+  ε-parameterisation is `D = x − σ·ε̂` (`c_skip = 1`, `c_out = −σ`), so both
+  terms are O(σ) and the answer is only O(σ_data) — an error `d` in `ε̂` lands
+  in `D` multiplied by σ. bf16's ulp is 2⁻⁷, so at σ_max = 157.4 with
+  σ_data = 0.5 the rounding noise has std **0.26 against a 0.5 signal, an SNR
+  of 1.9**. A one-step student generates at σ_max on *every* sample, so it
+  cannot emit a clean image no matter how well it is trained; the samples come
+  out as real structure buried in speckle and FID lands near 325 instead of
+  single digits. Both arms fail identically, which makes it look like a
+  method-independent training failure rather than an arithmetic one.
+  `VPPrecond.forward` now runs the network in fp32 whenever
+  `σ·ulp(bf16) > 0.05·σ_data` (σ ≳ 3.2 at σ_data = 0.5); `score` needs no
+  guard because it *divides* by σ. **EDM and interpolant preconditioning are
+  immune** — their `c_out` tends to σ_data and −1 respectively, which is what
+  that preconditioning is for, so Phases D and E are not exposed. Phase A is
+  also unaffected: `exp/10_lambda_real.py` and `validate_teacher` never
+  autocast.
+
 - **A teacher wrapped in the wrong preconditioning raises nothing.** Four
   families share one trainer (VP ε, EDM denoiser, interpolant velocity,
   synthetic). `validate_teacher` is what notices: `rel_mse` should be ~0 at
