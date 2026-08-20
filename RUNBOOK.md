@@ -396,6 +396,27 @@ python3 exp/10_lambda_real.py --teacher dit:$DD_CKPT_ROOT/DiT-XL-2-512x512.pt \
 
 ## 3. Watch-list during runs
 
+**Where is it up to?** There is no progress bar — training logs one line every
+`log_every` steps, and with six runs that is the only signal. `scripts/progress.py`
+turns those logs into progress and an ETA. It reads `<run>/train.log` and
+`<run>/config.json` off disk, so it works on a job that is already running, and
+on one started before `eta_h` existed:
+
+```bash
+python3 scripts/progress.py            # every run under runs/
+python3 scripts/progress.py -w 60      # refresh once a minute
+```
+
+```
+cifar10_dmd2    1100/20000   [#...................]   5.5%  0.825s/it   0.25 GPU-h  eta 4h20m
+
+slowest unfinished run finishes in ~4h20m (assumes the current rate holds)
+```
+
+A run whose log has not moved for ten minutes reads `STALLED`, because a crashed
+`torchrun` leaves its log looking exactly like a slow one. The training line
+itself now also carries `pct=` and `eta_h=` directly.
+
 * **Track A**: the launcher prints `effective real batch = N ... ok`. If it
   refuses, do not reach for `DD_ALLOW_SMALL_REAL_BATCH=1` — that turns the run
   into an ablation (FINDINGS §1.4).

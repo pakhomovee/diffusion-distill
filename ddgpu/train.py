@@ -304,6 +304,7 @@ def main():
     # GPU-seconds, not steps: eval.comparison_table refuses to compare runs that
     # differ in wall-clock, and methods here have different per-step cost.
     t0 = time.time()
+    it0 = it                      # steps already done BEFORE this session
     gpu_seconds = lambda: prior_gpu_s + (time.time() - t0) * world
 
     def save(tag):
@@ -333,7 +334,14 @@ def main():
             if ema:
                 ema.update(student)
             if it % c["log_every"] == 0:
-                logs["it"], logs["s_per_it"] = it, (time.time() - t0) / max(it, 1)
+                # Rate over THIS session's steps, not `it`: after a resume `it`
+                # already counts the previous session's work while t0 does not,
+                # which would report a step time several times too fast and an
+                # ETA to match.
+                sps = (time.time() - t0) / max(it - it0, 1)
+                logs["it"], logs["s_per_it"] = it, sps
+                logs["pct"] = 100.0 * it / c["steps"]
+                logs["eta_h"] = sps * (c["steps"] - it) / 3600
                 logs["gpu_hours"] = gpu_seconds() / 3600
                 hist.append(logs)
                 log(" ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
