@@ -204,6 +204,19 @@ If `/etc/network_turbo` exists it is sourced automatically. HF traffic goes
 through `HF_ENDPOINT=https://hf-mirror.com` with the Xet backend disabled
 (`HF_HUB_DISABLE_XET=1`); both can be overridden by exporting them yourself.
 
+Disabling Xet is the setting that matters. `hf_xet` does its own networking and
+ignores the `http_proxy` / `https_proxy` variables network_turbo exports, so
+behind that proxy it does not fail — it crawls at single-digit kB/s while
+printing a `reconstructing file` progress bar that looks like progress.
+
+That used to apply only to the bash entry points. The plain `python3 -m ...`
+commands — `ddgpu.teachers`, `ddgpu.prepare`, `exp/10_lambda_real.py` — inherit
+nothing from `common.sh`, so `ddgpu/hfenv.py` now applies the same policy on
+import of `ddgpu`, which is before any `huggingface_hub` import and therefore
+before the moment those variables are read. On a non-AutoDL box (no
+`/etc/network_turbo`) it disables Xet but leaves `HF_ENDPOINT` alone, rather
+than routing traffic through a mirror that would be the slow option there.
+
 The pipeline uses the machine's **current Python** (the AutoDL base env) and
 pip-installs `requirements.txt` — it does *not* create a conda env, because the
 AutoDL conda mirror often fails behind the turbo proxy. Set `DD_CONDA_ENV=<name>`

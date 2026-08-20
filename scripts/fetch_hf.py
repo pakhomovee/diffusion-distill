@@ -20,6 +20,9 @@ import os
 import shutil
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ddgpu.hfenv import setup_hf_env    # noqa: E402 -- must precede huggingface_hub
+
 
 def free_gb(path):
     p = path
@@ -40,12 +43,14 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
+    setup_hf_env()
     have = free_gb(a.dest)
     print(f"repo      : {a.repo} ({a.repo_type})")
     print(f"dest      : {a.dest}")
     print(f"patterns  : {a.allow_patterns or 'ALL FILES'}")
     print(f"free space: {have:.1f} GB (need {a.require_gb:.0f} GB)")
-    print(f"HF_ENDPOINT={os.environ.get('HF_ENDPOINT', '(default)')}")
+    print(f"HF_ENDPOINT={os.environ.get('HF_ENDPOINT', '(default)')}   "
+          f"xet_disabled={os.environ.get('HF_HUB_DISABLE_XET')}")
 
     if a.dry_run:
         print("--dry-run: nothing downloaded")

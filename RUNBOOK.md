@@ -96,6 +96,29 @@ fails, install the build matching the image's torch before anything else.
 A 4090 reports capability `(8, 9)` and is fine on any modern CUDA build. A 5090
 is `(12, 0)` and needs CUDA 12.8+ / torch ≥ 2.7.
 
+**If a HuggingFace download crawls at single-digit kB/s** while printing a
+`reconstructing file` progress bar, that is the **Xet** backend. `hf_xet` is a
+Rust client with its own networking that ignores the `http_proxy` /
+`https_proxy` variables `/etc/network_turbo` exports — so sourcing network_turbo
+changes nothing, and the transfer does not fail, it just never finishes:
+
+```
+diffusion_pytorch_model.safetensors: downloading bytes: 134MB, 4.52kB/s
+diffusion_pytorch_model.safetensors: reconstructing file: 56% | 80.5MB / 143MB
+```
+
+Importing `ddgpu` now sets `HF_HUB_DISABLE_XET=1` (and, on AutoDL only,
+`HF_ENDPOINT=https://hf-mirror.com`) before `huggingface_hub` is imported, which
+is the only moment it reads them. Anything you export yourself still wins. To
+force it by hand, or on a box running an older checkout:
+
+```bash
+export HF_HUB_DISABLE_XET=1
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+Kill the crawling download first — a resumed one will pick the fast path.
+
 ### 1. CIFAR-10 data — **GPUs: 1** (`pixels` is CPU-only; `refstats` needs the GPU)
 
 ```bash
