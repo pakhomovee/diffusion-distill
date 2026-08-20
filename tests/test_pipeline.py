@@ -274,6 +274,69 @@ def t_lambda_probe():
           (pr.reset(), float(pr.cnt.sum()))[1] == 0.0)
 
 
+def t_torchrun_flag_safety():
+    """No flag we hand a torchrun-launched module may abbreviate a torchrun one.
+
+    argparse abbreviation-matches every `--x` on the command line against
+    torchrun's own options before the training script's REMAINDER can claim
+    them. Two ways that bites, both silent until runtime:
+
+      * ambiguous (`--run` -> --run-path/--run_path) -> torchrun exits with
+        "ambiguous option" and the script never starts;
+      * unique (`--foo` matching exactly one torchrun option) -> torchrun eats
+        the flag and the script silently runs with a default.
+
+    Whether the ambiguous case trips depends on the argparse version, so it
+    fails on the GPU box and passes on the laptop. This checks the invariant
+    directly, against whatever torch is installed.
+    """
+    from torch.distributed.run import get_args_parser
+    tr = {o for o in get_args_parser()._option_string_actions if o.startswith("--")}
+
+    sh = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "scripts", "eval_all.sh")).read()
+    m = re.search(r"CMD=\((.*?)\)\n", sh, re.S)
+    check("eval_all.sh: found the torchrun command", bool(m))
+    if not m:
+        return
+    block = re.sub(r"#[^\n]*", "", m.group(1))          # strip comments
+    check("eval_all.sh launches ddgpu.generate", "ddgpu.generate" in block)
+
+    # Underscores included: torchrun's own flags are spelled --nproc_per_node
+    # here, and truncating at the underscore would flag them as abbreviations.
+    flags = sorted(set(re.findall(r"(?<![\w-])--[a-z][a-z0-9_-]*", block)))
+    bad = {}
+    for f in flags:
+        if f in tr:                                     # torchrun's own, fine
+            continue
+        hits = [o for o in tr if o.startswith(f)]
+        if hits:
+            bad[f] = sorted(hits)
+    check("no script flag abbreviates a torchrun option",
+          not bad, "; ".join(f"{k} -> {v}" for k, v in bad.items()) or f"checked {flags}")
+
+    # The module must accept the safe spellings, and still accept the old ones
+    # for direct `python3 -m ddgpu.generate` use.
+    from ddgpu.generate import build_argparser
+    safe = build_argparser().parse_args(
+        ["--run-dir", "R", "--n-samples", "7", "--ref", "F"])
+    old = build_argparser().parse_args(["--run", "R", "--n", "7", "--ref", "F"])
+    check("generate accepts --run-dir/--n-samples",
+          (safe.run, safe.n) == ("R", 7), f"{safe.run!r} {safe.n}")
+    check("old --run/--n still work when invoked directly",
+          (old.run, old.n) == ("R", 7), f"{old.run!r} {old.n}")
+
+    # The whole point: what eval_all.sh sends must survive torchrun's parser and
+    # arrive at the script intact.
+    parsed = get_args_parser().parse_args(
+        ["--standalone", "--nproc_per_node=2", "-m", "ddgpu.generate",
+         "--run-dir", "R", "--n-samples", "7", "--ref", "F"])
+    check("torchrun passes the flags through untouched",
+          parsed.training_script_args ==
+          ["--run-dir", "R", "--n-samples", "7", "--ref", "F"],
+          str(parsed.training_script_args))
+
+
 def t_pixel_eval_path():
     """The cheap tier's eval must not route the student through the SD VAE.
 
@@ -342,7 +405,7 @@ if __name__ == "__main__":
     for fn in (t_pos_embed_matches_official, t_vp_schedule_roundtrip,
                t_vp_precond_exact_on_gaussian, t_student_grid, t_sigma_sampler,
                t_checkpoint_remap, t_dataset_moments, t_config_delta, t_ema,
-               t_lambda_probe, t_pixel_eval_path):
+               t_lambda_probe, t_torchrun_flag_safety, t_pixel_eval_path):
         print(f"\n== {fn.__name__} ==")
         fn()
     print("\n" + ("ALL PASS" if not FAIL else f"{len(FAIL)} FAILED: {FAIL}"))

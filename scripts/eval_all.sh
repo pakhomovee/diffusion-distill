@@ -87,8 +87,11 @@ for d in "$REPO_ROOT"/runs/*/; do
 
   CMD=(torchrun --standalone --nproc_per_node="$NPROC"
        --master_port="${MASTER_PORT:-29532}"
-       -m ddgpu.generate --run "$d" --ckpt "$CKPT" --weights "$WEIGHTS"
-       --n "$N" --ref "$REF_NPZ" --out "$RESULTS" --name "$name")
+       # --run-dir / --n-samples, not --run / --n: the short spellings are
+       # ambiguous abbreviations of torchrun's own options and it refuses the
+       # command before the script starts. See ddgpu/generate.py's build_argparser().
+       -m ddgpu.generate --run-dir "$d" --ckpt "$CKPT" --weights "$WEIGHTS"
+       --n-samples "$N" --ref "$REF_NPZ" --out "$RESULTS" --name "$name")
   log "${CMD[*]}"
   if [[ "$DRY_RUN" == "1" ]]; then continue; fi
   if ! "${CMD[@]}" 2>&1 | tee -a "$d/eval.log"; then

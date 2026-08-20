@@ -1,7 +1,7 @@
 """Sample a trained student, decode, and score it. Emits an `eval.RunRecord`.
 
   torchrun --nproc_per_node=8 -m ddgpu.generate \
-      --run runs/dit_xl_256_robust --ckpt final --n 50000 \
+      --run-dir runs/dit_xl_256_robust --ckpt final --n-samples 50000 \
       --ref /data/in256/ref_256_50000.npz
 
 Three things this deliberately does:
@@ -138,13 +138,29 @@ def _gather_cat(t, world):
     return torch.cat([b[:int(s.item())] for b, s in zip(buf, sizes)])
 
 
-def main():
+def build_argparser():
+    """Separate from `main` so tests can check the flag names without running.
+
+    The names here are load-bearing -- see the comment below -- and the only
+    cheap way to keep them that way is a test that parses them.
+    """
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run", help="run directory (uses config.resolved.json)")
+    # `--run-dir` and `--n-samples`, NOT `--run` and `--n`, because this module
+    # is launched under torchrun. argparse abbreviation-matches every `--x` on
+    # the command line against torchrun's OWN options before the script name's
+    # REMAINDER can claim them, and both short spellings are ambiguous there:
+    # `--run` prefixes --run-path/--run_path, and `--n` prefixes --nnodes,
+    # --nproc-per-node, --node-rank, --no-python and their underscore aliases.
+    # torchrun then exits with "ambiguous option" and the script never runs.
+    # Whether it trips depends on the argparse version, so it fails on some
+    # boxes and not others. The old spellings stay as aliases for direct
+    # `python3 -m ddgpu.generate` use; do not "tidy" the long names away.
+    ap.add_argument("--run-dir", "--run", dest="run",
+                    help="run directory (uses config.resolved.json)")
     ap.add_argument("--config", default=None)
     ap.add_argument("--ckpt", default="final", help="tag or explicit .pt path")
     ap.add_argument("--weights", default="ema", choices=["ema", "student"])
-    ap.add_argument("--n", type=int, default=50000)
+    ap.add_argument("--n-samples", "--n", dest="n", type=int, default=50000)
     ap.add_argument("--ref", required=True, help=".npz with 'feats' (N,2048)")
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--pr-n", type=int, default=10000,
@@ -152,7 +168,11 @@ def main():
     ap.add_argument("--name", default=None)
     ap.add_argument("--out", default="results/runs.json")
     ap.add_argument("--grid", type=int, default=64, help="also save an NxN sample grid")
-    a = ap.parse_args()
+    return ap
+
+
+def main():
+    a = build_argparser().parse_args()
 
     rank, world, dev = _setup()
     ck_path = a.ckpt if a.ckpt.endswith(".pt") else f"{a.run}/ckpt_{a.ckpt}.pt"
