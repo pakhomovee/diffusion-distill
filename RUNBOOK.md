@@ -80,14 +80,27 @@ Every step is idempotent; prep steps skip work that already exists.
 
 ```bash
 cd ~/autodl-tmp/diffusion-distill
+
+# Persist these -- do not just export them in one shell. Every later step
+# interpolates "$DD_DATA_ROOT/..." into a path, and an unset variable expands to
+# a working-looking absolute path: "$DD_DATA_ROOT/cifar10" becomes "/cifar10".
+cat >> ~/.bashrc <<'EOF'
 export DD_DATA_ROOT=/root/autodl-tmp/data
 export DD_CKPT_ROOT=/root/autodl-tmp/ckpt
+EOF
+source ~/.bashrc
 mkdir -p "$DD_DATA_ROOT" "$DD_CKPT_ROOT"
+echo "data=$DD_DATA_ROOT ckpt=$DD_CKPT_ROOT"     # both must be non-empty
 
 python3 -c "import torch,torchvision;print(torch.__version__, torchvision.__version__, torch.cuda.get_device_capability())"
 
 scripts/smoke.sh --gpu          # done once on the 4090 -- redo on any new box
 ```
+
+If a step ever fails with a path like `/cifar10` or `/in64`, that is this
+variable being unset in the shell you ran it from — `build_dataset` now says so
+rather than reporting a missing `train_moments.npy`. Check for a stray `/cifar10`
+at the filesystem root from before the exports were set, and delete it.
 
 `torchvision` is required by the CIFAR-10 path and is **not** in
 `requirements.txt` (torch/torchvision are deliberately unpinned). If that import

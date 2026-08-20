@@ -162,10 +162,29 @@ def build_dataset(c):
     if c["data"].startswith("gaussian"):
         ds = GaussianData(c["data"].split(":", 1)[-1] if ":" in c["data"] else "")
         return ds, dict(ds.meta)
-    meta = load_meta(c["data"])
+    root = c["data"]
+    # Fail on the actual problem. Without this the missing-directory case falls
+    # through to LatentDataset (no meta.json -> format is unknown -> latent is
+    # the default) and reports "no train_moments.npy", which describes a latent
+    # dataset the caller may never have asked for. `train.sh` guards this
+    # already; the bare `python3 -m ddgpu.teachers` / exp entry points do not.
+    if not os.path.isdir(root):
+        raise FileNotFoundError(
+            f"dataset directory does not exist: {root}\n"
+            "  * has it been prepared?  python3 -m ddgpu.prepare pixels "
+            "--source cifar10 --dest <dir> --resolution 32\n"
+            "  * does the path look like an unset variable expanded -- "
+            "'/cifar10' from \"$DD_DATA_ROOT/cifar10\"?  export DD_DATA_ROOT first.")
+    meta = load_meta(root)
     flip = c.get("flip", False)
-    ds = (PixelDataset(c["data"], flip=flip) if meta.get("format") == "pixels"
-          else LatentDataset(c["data"], flip=flip))
+    if meta.get("format") == "pixels":
+        ds = PixelDataset(root, flip=flip)
+    else:
+        if not meta:
+            # Legacy latent dirs predate meta.json and are still supported, so
+            # this is a note on the way past, not a refusal.
+            print(f"[data] no meta.json in {root}; reading it as a LATENT dataset")
+        ds = LatentDataset(root, flip=flip)
     resolved = {}
     for k in ("sigma_data", "shape", "n_classes", "space"):
         if k in meta:
