@@ -274,6 +274,51 @@ def t_lambda_probe():
           (pr.reset(), float(pr.cnt.sum()))[1] == 0.0)
 
 
+def t_fid_math():
+    """FID must be right, and must survive scipy moving under us.
+
+    `fid_from_feats` called `sqrtm(..., disp=False)`; scipy 1.17 removed that
+    argument, so the whole eval crashed -- AFTER sampling 50k images, because
+    scoring is the last thing that happens. Testing the API alone would not be
+    enough: the version shim also has to leave the number unchanged.
+
+    The exact case: shifting every feature by a constant leaves the covariance
+    identical, so `tr(C1 + C2 - 2*sqrtm(C1 C2))` vanishes and FID collapses to
+    the squared mean distance. That pins the trace term and the shim at once.
+    """
+    from ddgpu.eval import fid_from_feats, _sqrtm
+
+    g = torch.Generator().manual_seed(0)
+    f1 = torch.randn(256, 16, generator=g)
+
+    check("FID of a set against itself is 0", abs(fid_from_feats(f1, f1)) < 1e-6,
+          f"{fid_from_feats(f1, f1):.3e}")
+
+    delta = torch.linspace(0.1, 0.8, 16)
+    f2 = f1 + delta                            # same covariance, shifted mean
+    want = float((delta ** 2).sum())
+    got = fid_from_feats(f1, f2)
+    check("FID of a pure mean shift equals the squared mean distance",
+          abs(got - want) < 1e-3 * max(want, 1.0), f"{got:.6f} vs {want:.6f}")
+
+    # The matrix square root is the part scipy owns; check it squares back.
+    c1 = np.cov(f1.numpy(), rowvar=False)
+    c2 = np.cov((f1 * 1.7 + 0.3).numpy(), rowvar=False)
+    s = _sqrtm(c1.dot(c2))
+    if np.iscomplexobj(s):
+        s = s.real
+    check("_sqrtm(M) squared reproduces M",
+          bool(np.allclose(s.dot(s), c1.dot(c2), atol=1e-6)),
+          f"max err {np.abs(s.dot(s) - c1.dot(c2)).max():.2e}")
+
+    # Scaling one set up must increase FID -- catches a sign or factor slip in
+    # the trace term that the mean-shift case cannot see.
+    near = fid_from_feats(f1, f1 * 1.05)
+    far = fid_from_feats(f1, f1 * 1.50)
+    check("FID grows with a covariance mismatch", 0 < near < far,
+          f"{near:.4f} < {far:.4f}")
+
+
 def t_torchrun_flag_safety():
     """No flag we hand a torchrun-launched module may abbreviate a torchrun one.
 
@@ -405,7 +450,7 @@ if __name__ == "__main__":
     for fn in (t_pos_embed_matches_official, t_vp_schedule_roundtrip,
                t_vp_precond_exact_on_gaussian, t_student_grid, t_sigma_sampler,
                t_checkpoint_remap, t_dataset_moments, t_config_delta, t_ema,
-               t_lambda_probe, t_torchrun_flag_safety, t_pixel_eval_path):
+               t_lambda_probe, t_fid_math, t_torchrun_flag_safety, t_pixel_eval_path):
         print(f"\n== {fn.__name__} ==")
         fn()
     print("\n" + ("ALL PASS" if not FAIL else f"{len(FAIL)} FAILED: {FAIL}"))

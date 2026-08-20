@@ -27,12 +27,28 @@ def inception_features(images, model, batch=64, device="cuda"):
     return torch.cat(out)
 
 
-def fid_from_feats(f1, f2):
+def _sqrtm(m):
+    """`scipy.linalg.sqrtm`, across the 1.17 signature change.
+
+    `disp=False` only ever suppressed a PRINTED warning about the error
+    estimate and returned it as a second value instead; scipy 1.17 removed the
+    argument and returns the matrix alone. Neither spelling changes the number,
+    so this picks whichever the installed scipy accepts rather than pinning a
+    version. Passing `disp=False` to a modern scipy is a TypeError raised at the
+    very end of a sampling run -- see `generate.main`'s preflight.
+    """
+    import inspect
     from scipy import linalg
+    if "disp" in inspect.signature(linalg.sqrtm).parameters:
+        return linalg.sqrtm(m, disp=False)[0]
+    return linalg.sqrtm(m)
+
+
+def fid_from_feats(f1, f2):
     m1, m2 = f1.mean(0).numpy(), f2.mean(0).numpy()
     c1 = np.cov(f1.numpy(), rowvar=False)
     c2 = np.cov(f2.numpy(), rowvar=False)
-    cc, _ = linalg.sqrtm(c1.dot(c2), disp=False)
+    cc = _sqrtm(c1.dot(c2))
     if np.iscomplexobj(cc):
         cc = cc.real
     return float(((m1 - m2) ** 2).sum() + np.trace(c1 + c2 - 2 * cc))

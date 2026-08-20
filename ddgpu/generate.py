@@ -198,6 +198,25 @@ def main():
     inc = build_inception(dev)
     scale = c.get("latent_scale", LATENT_SCALE)
 
+    # Everything that can only fail AFTER the sampling run, exercised before it.
+    # Sampling 50k images takes ~40 minutes; a bad reference file or a scipy
+    # whose sqrtm signature has changed under us should cost seconds instead.
+    f_real = None
+    if rank == 0:
+        f_real = torch.from_numpy(np.load(a.ref)["feats"]).float()
+        if f_real.ndim != 2 or f_real.shape[1] != 2048:
+            raise SystemExit(f"reference {a.ref} holds {tuple(f_real.shape)}; "
+                             "expected (N, 2048) pool3 features from "
+                             "`ddgpu.prepare refstats`")
+        if len(f_real) < a.n:
+            print(f"[generate] NOTE: reference has {len(f_real)} samples but "
+                  f"--n-samples is {a.n}; FID is not comparable to numbers "
+                  "computed against a 50k reference")
+        fid_from_feats(f_real[:8, :16], f_real[8:16, :16])
+        precision_recall(f_real[:8, :16], f_real[8:16, :16])
+        print(f"[generate] preflight OK: reference {tuple(f_real.shape)}, "
+              "FID and precision/recall callable", flush=True)
+
     per = (a.n + world - 1) // world
     gen = torch.Generator(device=dev).manual_seed(1234 + rank)
     feats, grid_imgs, done = [], [], 0
@@ -217,8 +236,7 @@ def main():
     if rank != 0:
         return
 
-    f_real = torch.from_numpy(np.load(a.ref)["feats"]).float()
-    fid = fid_from_feats(f_real, f_fake)
+    fid = fid_from_feats(f_real, f_fake)          # loaded in the preflight above
     k = min(a.pr_n, len(f_real), len(f_fake))
     prec, rec = precision_recall(f_real[:k], f_fake[:k])
     r = RunRecord(a.name or os.path.basename(a.run or os.path.dirname(ck_path)),
