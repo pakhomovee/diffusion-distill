@@ -246,6 +246,16 @@ python3 exp/09_plot_run.py runs/cifar10_robust runs/cifar10_dmd2
 Read the **seed-grouped** table with its standard-error verdict, not the flat
 one. A gap inside one standard error is "no measured difference", not a win.
 
+`eval_all.sh` keeps going when a run fails to score and reports the names at the
+end, so **the actual error is in the per-run log, not on your terminal**:
+
+```bash
+tail -30 runs/*/eval.log
+```
+
+If the table then says `no eval records`, that is the symptom of every run
+having failed, not a separate problem — read the eval logs first.
+
 ### 6. ImageNet-64 teacher + data — **GPUs: 1** (`pixels` is CPU-only; `refstats` needs the GPU)
 
 ```bash

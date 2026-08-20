@@ -145,6 +145,15 @@ def records_from_json(path, weights=None, step=None):
     Runs whose names differ only by a `_sN` suffix are separate seeds of the
     same arm; `seed_table` groups them.
     """
+    # No records file means every `ddgpu.generate` in the sweep failed before it
+    # could write one. A raw FileNotFoundError here buries that under a
+    # traceback for the wrong file -- the real error is in <run>/eval.log.
+    if not os.path.exists(path):
+        raise SystemExit(
+            f"no eval records at {path}\n"
+            "  Nothing was scored, so there is no table to print. This is a\n"
+            "  SYMPTOM, not the cause: every run's ddgpu.generate failed first.\n"
+            "  The real error is in the per-run log:  tail -30 runs/*/eval.log")
     rows = json.load(open(path))
     if weights:
         rows = [r for r in rows if (r.get("extra") or {}).get("weights") == weights]

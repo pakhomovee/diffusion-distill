@@ -274,12 +274,75 @@ def t_lambda_probe():
           (pr.reset(), float(pr.cnt.sum()))[1] == 0.0)
 
 
+def t_pixel_eval_path():
+    """The cheap tier's eval must not route the student through the SD VAE.
+
+    CIFAR-10 and ImageNet-64 train in PIXEL space: the student output is the
+    image. `generate.main` was written for the latent tier and decoded
+    unconditionally, which hands a 3-channel image to a decoder expecting 4
+    latent channels -- so the entire cheap programme could be trained and then
+    not scored. Nothing else in the suite executes `ddgpu.generate`.
+
+    The second half is the subtler half: the fake side of a FID comparison must
+    convert to uint8 exactly as `prepare.cmd_refstats` converts the real side.
+    A different rounding or a missing clamp would land in the FID and be read as
+    a property of the student.
+    """
+    from ddgpu.generate import is_pixel_space, decode, sample_batch
+    from ddgpu.data import build_dataset
+
+    check("pixel space from meta", is_pixel_space(dict(space="pixel", shape=[3, 32, 32])))
+    check("latent space from meta", not is_pixel_space(dict(space="latent", shape=[4, 32, 32])))
+    # Run dirs written before `space` was resolved into the config fall back to
+    # the channel count; getting this backwards is silent in both directions.
+    check("legacy config: 3ch -> pixel", is_pixel_space(dict(shape=[3, 32, 32])))
+    check("legacy config: 4ch -> latent", not is_pixel_space(dict(shape=[4, 16, 16])))
+
+    # A real pixel dataset dir, resolved the way training resolves it.
+    n, hw = 8, 8
+    with tempfile.TemporaryDirectory() as td:
+        np.save(f"{td}/train_pixels.npy",
+                np.random.randint(0, 256, (n, 3, hw, hw), dtype=np.uint8))
+        np.save(f"{td}/train_labels.npy", np.zeros(n, np.int64))
+        json.dump(dict(n=n, resolution=hw, shape=[3, hw, hw], n_classes=1,
+                       space="pixel", format="pixels", sigma_data=0.5,
+                       latent_scale=1.0), open(f"{td}/meta.json", "w"))
+        _, resolved = build_dataset(dict(data=td, shape=[3, hw, hw], n_classes=1))
+    check("build_dataset resolves space=pixel", resolved.get("space") == "pixel")
+    check("resolved pixel config takes the no-VAE path", is_pixel_space(resolved))
+
+    # End-to-end: sample a pixel student and decode it with no VAE at all.
+    from ddgpu.dit import make_dit
+    from ddgpu.train import wrap_precond
+    c = dict(shape=[3, hw, hw], latent_size=hw, n_classes=1, arch="DiT-S/2",
+             sigma_data=0.5, sigma_max=80.0, n_student_steps=1, precond="edm",
+             space="pixel", latent_scale=1.0)
+    net = make_dit(c["arch"], input_size=hw, in_ch=3, n_classes=1, learn_sigma=False)
+    G = wrap_precond(net, c, None).eval()
+    gen = torch.Generator().manual_seed(0)
+    with torch.no_grad():
+        z, _ = sample_batch(G, 4, c, None, torch.device("cpu"), gen)
+    check("pixel student emits image-shaped output", tuple(z.shape) == (4, 3, hw, hw),
+          str(tuple(z.shape)))
+    imgs = decode(z, None, c["latent_scale"])
+    check("no-VAE decode gives uint8 (N,3,H,W)",
+          imgs.dtype == torch.uint8 and tuple(imgs.shape) == (4, 3, hw, hw),
+          f"{imgs.dtype} {tuple(imgs.shape)}")
+
+    # Bit-for-bit against prepare.cmd_refstats' own conversion, out-of-range included.
+    probe = torch.tensor([-3.0, -1.0, -0.5, 0.0, 0.5, 1.0, 3.0]).reshape(1, 1, 1, 7)
+    ref = ((probe + 1) * 127.5).clamp(0, 255).to(torch.uint8)
+    check("uint8 conversion matches the FID reference side bit-for-bit",
+          bool((decode(probe, None, 1.0) == ref).all()),
+          f"{decode(probe, None, 1.0).flatten().tolist()} vs {ref.flatten().tolist()}")
+
+
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
     for fn in (t_pos_embed_matches_official, t_vp_schedule_roundtrip,
                t_vp_precond_exact_on_gaussian, t_student_grid, t_sigma_sampler,
                t_checkpoint_remap, t_dataset_moments, t_config_delta, t_ema,
-               t_lambda_probe):
+               t_lambda_probe, t_pixel_eval_path):
         print(f"\n== {fn.__name__} ==")
         fn()
     print("\n" + ("ALL PASS" if not FAIL else f"{len(FAIL)} FAILED: {FAIL}"))

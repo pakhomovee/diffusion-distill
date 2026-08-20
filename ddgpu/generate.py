@@ -14,6 +14,8 @@ Three things this deliberately does:
 * **Featurises each batch as it is produced.** 50k decoded 256px images is 9.8
   GiB of uint8 -- buffering them to score at the end is the easiest way to OOM
   an eval that was supposed to be the cheap part.
+* **Skips the VAE entirely in pixel space.** The cheap tier's student emits the
+  image, so there is nothing to decode; see `is_pixel_space`.
 
 The Inception features come from `pytorch_fid` (the canonical FID network) via
 `ddgpu.prepare`, which is also what produced the reference `.npz`. Same module
@@ -89,8 +91,33 @@ def sample_batch(G, b, c, sch, device, gen, cfg_scale=1.0):
     return x, y
 
 
+def is_pixel_space(c):
+    """Does this run's student emit images directly, with no VAE in the path?
+
+    The cheap tier (CIFAR-10, ImageNet-64) trains in pixel space, so its student
+    output IS the image and running it through the SD VAE decoder is not merely
+    wasteful -- the decoder wants 4 latent channels and would be handed 3.
+
+    `space` comes from the dataset's meta.json via `data.build_dataset` and is
+    the authority. The channel count is a fallback for run directories written
+    before `space` was resolved into the config: latents are 4-channel here,
+    images are 3.
+    """
+    if "space" in c:
+        return c["space"] == "pixel"
+    return c["shape"][0] == 3
+
+
 @torch.no_grad()
 def decode(z, vae, scale, batch=32):
+    """Model output -> uint8 (N,3,H,W), matching `prepare.cmd_refstats` exactly.
+
+    The real side of the FID comparison converts with `((x + 1) * 127.5)`, so
+    the fake side must too; a half-LSB difference here would be attributed to
+    the student. `vae=None` is the pixel path -- same conversion, no decode.
+    """
+    if vae is None:
+        return ((z.float().clamp(-1, 1) + 1) * 127.5).to(torch.uint8)
     out = []
     for i in range(0, len(z), batch):
         x = vae.decode(z[i:i + batch].float() / scale).sample
@@ -138,10 +165,16 @@ def main():
         print("[generate] no EMA in checkpoint; falling back to raw student weights")
     G, sch = build_student(c, dev, state)
 
-    from diffusers import AutoencoderKL
     from .prepare import build_inception, inception_feats, LATENT_SCALE
-    vae = AutoencoderKL.from_pretrained(c.get("vae", "stabilityai/sd-vae-ft-mse")) \
-        .to(dev).eval()
+    pixel = is_pixel_space(c)
+    vae = None
+    if not pixel:
+        from diffusers import AutoencoderKL
+        vae = AutoencoderKL.from_pretrained(c.get("vae", "stabilityai/sd-vae-ft-mse")) \
+            .to(dev).eval()
+    elif rank == 0:
+        print(f"[generate] pixel space ({c['shape'][0]}x{c['shape'][1]}x"
+              f"{c['shape'][2]}); no VAE in the eval path")
     inc = build_inception(dev)
     scale = c.get("latent_scale", LATENT_SCALE)
 
