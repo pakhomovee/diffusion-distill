@@ -243,6 +243,28 @@ signature cost a full six-run programme once. An FID in the hundreds with
 `recall` exactly 0.000 is the same thing seen numerically. Twenty minutes here
 saves five hours per arm.
 
+**No GPU box to hand?** `scripts/colab_check.py` scores a single checkpoint
+anywhere — Colab, a laptop, a fresh VM — because `train.save` writes the run's
+`config` INTO the `.pt`. Nothing else from the training box is needed: it
+rebuilds the FID reference from torchvision's CIFAR-10 through `ddgpu.prepare`,
+the same path that produced `ref_32_50000.npz`, so the number is comparable
+rather than merely similar.
+
+```bash
+!git clone -b worktree-runbook https://github.com/pakhomovee/diffusion-distill.git
+%cd diffusion-distill
+!pip install -q diffusers pytorch-fid
+
+!python3 scripts/colab_check.py \
+    --ckpt hf:pakhomovee/distill:cifar10_dmd2/ckpt_final.pt \
+    --fid-n 10000 --compare-guard
+```
+
+`--compare-guard` renders the same seeds twice, with `VPPrecond`'s fp32 guard on
+and off, and prints the mean difference. Off is the old bf16 failure; if the two
+grids are indistinguishable, precision is *not* what is wrong with the run and
+the search moves elsewhere.
+
 Serial equivalent on a 1-GPU box (~23 h):
 
 ```bash

@@ -252,9 +252,17 @@ def main():
                                     and (x.get("extra") or {}).get("weights") == a.weights)]
     json.dump(recs + [r.as_dict()], open(a.out, "w"), indent=1)
 
-    if grid_imgs and a.run:
-        _save_grid(torch.cat(grid_imgs)[:a.grid], f"{a.run}/samples_{a.ckpt}.png")
-        print(f"[generate] grid -> {a.run}/samples_{a.ckpt}.png")
+    if grid_imgs:
+        # `--ckpt` is a tag ("final") OR an explicit path. Interpolating the path
+        # form raw builds a nested name -- "runs/x/samples_/tmp/ckpt_final.pt.png"
+        # -- whose directory does not exist, so the grid write throws AFTER the
+        # sampling run has already cost forty minutes. Take the basename, and
+        # fall back to the checkpoint's own directory when no --run-dir was
+        # given, so a bare `--ckpt some/where.pt` still leaves a grid behind.
+        tag = os.path.splitext(os.path.basename(a.ckpt))[0]
+        path = f"{a.run or os.path.dirname(ck_path) or '.'}/samples_{tag}.png"
+        _save_grid(torch.cat(grid_imgs)[:a.grid], path)
+        print(f"[generate] grid -> {path}")
 
 
 def _save_grid(imgs, path, ncol=8):
