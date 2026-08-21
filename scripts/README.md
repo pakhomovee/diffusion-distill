@@ -118,6 +118,25 @@ checks `$DD_DATA_ROOT`, then `<repo>/data`, then `~/.cache/dd-data` for either
 hit, and prints which. `$DD_TV_ROOT` short-circuits that search and also
 redirects the download when the file is genuinely absent.
 
+When the file is genuinely absent and the box is ephemeral — Colab, CI, a fresh
+VM — prefer **`--source cifar10-hf`**. torchvision downloads from
+cs.toronto.edu, which throttles such boxes to ~100 kB/s (half an hour for
+170 MB, restarted on every reconnect); the mirror reads the same images from
+`uoft-cs/cifar10` on HF's CDN in about two seconds. That they hold the same
+images was verified, not assumed: all 50 000 (image, label) pairs match the
+canonical tarball (md5 `c58f30108f718f92721af3b95e74349a`) byte-for-byte, as a
+set.
+
+The **row order differs**, which matters in exactly one place. FID over the full
+50 000 is permutation-invariant and so is unaffected; but a sub-sampled
+reference (`--n <50000`) or precision/recall (first k rows) draws a *different*
+subset here than it would from torchvision — equally valid, equally
+distributed, and different by sampling noise. Pick one source per comparison
+and stay with it.
+
+Needs `pyarrow`; `tests/test_pipeline.py::t_cifar_mirror` pins the presentation
+arithmetic so the two sources cannot silently drift apart.
+
 `latents` writes an (N, 8, H/8, W/8) fp16 memmap of SD-VAE **moments** — the
 latent is resampled every read, as DiT trains — plus `meta.json` carrying the
 **measured** `sigma_data`. Disk: ~21 GB for ImageNet-256, ~84 GB for 512.

@@ -14,4 +14,6 @@ diffusers>=0.27       # AutoencoderKL (SD-VAE) only
 safetensors>=0.4
 huggingface_hub>=0.20
 pytorch-fid>=0.3.0    # the canonical FID InceptionV3; ddgpu.prepare + ddgpu.generate
+pyarrow>=12.0         # only for `--source cifar10-hf`, the CIFAR mirror that is
+                      # not throttled; torchvision's own path needs none of it
 matplotlib>=3.7       # figures/ only

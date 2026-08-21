@@ -25,7 +25,7 @@ same module, so any residual difference cancels in the comparison.
 
 Both write into `dest` and skip work that is already there.
 """
-import argparse, json, os, subprocess, sys
+import argparse, io, json, os, subprocess, sys
 import numpy as np
 import torch
 from PIL import Image
@@ -158,10 +158,83 @@ class TorchvisionImages(torch.utils.data.Dataset):
         return x.float() / 127.5 - 1.0, y
 
 
+class HFParquetImages(torch.utils.data.Dataset):
+    """CIFAR-10 from the HuggingFace mirror, for boxes the canonical host hates.
+
+    torchvision fetches CIFAR-10 from cs.toronto.edu, which throttles cloud
+    notebooks and CI runners to ~100 kB/s: 170 MB becomes half an hour, and a
+    reconnected runtime starts from zero. `uoft-cs/cifar10` carries the same
+    images as PNG-in-parquet on HF's CDN, which measures ~50 MB/s from the same
+    box -- 2.4 s for the train split.
+
+    VERIFIED against the canonical tarball (`cifar-10-python.tar.gz`, md5
+    c58f30108f718f92721af3b95e74349a): all 50 000 (image, label) pairs match
+    byte-for-byte, as a SET. The row ORDER differs, and that is the one thing to
+    keep in mind:
+
+      * FID over the full 50 000 is unaffected. Mean and covariance are
+        permutation-invariant, so the two sources agree to float summation
+        order -- orders of magnitude below any difference worth acting on.
+      * A SUBSET is a different subset. `cmd_refstats --n <50000` takes an
+        evenly spaced slice, and `precision_recall` takes the first k rows, so
+        both draw different (equally valid, equally distributed) images here
+        than they would from torchvision. Expect P/R to move by sampling noise
+        between the two sources, exactly as it would between two seeds.
+
+    So: identical FID, sampling-noise-level differences in P/R and in
+    sub-sampled references. Do not mix sources within one comparison.
+    `tests/test_pipeline.py::t_cifar_mirror` re-checks the parts of the
+    contract that need no network.
+
+    Presented exactly like `TorchvisionImages` -- [-1, 1], (C,H,W) -- so
+    `cmd_refstats` and `cmd_latents` cannot tell the two apart.
+    """
+    SETS = {"cifar10-hf": dict(repo="uoft-cs/cifar10", n_classes=10,
+                               train="plain_text/train-00000-of-00001.parquet",
+                               test="plain_text/test-00000-of-00001.parquet")}
+
+    def __init__(self, name, resolution, train=True):
+        spec = self.SETS[name]
+        try:
+            import pyarrow.parquet as pq
+        except ImportError as e:
+            raise SystemExit(
+                f"--source {name} reads a parquet mirror and needs pyarrow:\n"
+                "  pip install pyarrow\n"
+                "Or use `--source cifar10` to go through torchvision, which "
+                "downloads from cs.toronto.edu instead.") from e
+        from huggingface_hub import hf_hub_download
+        path = hf_hub_download(spec["repo"], spec["train" if train else "test"],
+                               repo_type="dataset")
+        t = pq.read_table(path, columns=["img", "label"])
+        # Keep the PNGs encoded and decode in __getitem__: a Subset of 2 000
+        # should not pay to decode 50 000, and the encoded column is no larger
+        # than the decoded pixels would be.
+        self.blobs = t.column("img").combine_chunks().field("bytes")
+        self.labels = t.column("label").to_pylist()
+        self.res, self.n_classes = resolution, spec["n_classes"]
+        self.classes = [str(i) for i in range(self.n_classes)]
+        self.samples = [(None, int(y)) for y in self.labels]
+        print(f"[prepare] {name}: {len(self.labels)} images from "
+              f"{spec['repo']} (HF mirror, not cs.toronto.edu)")
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, i):
+        img = Image.open(io.BytesIO(self.blobs[i].as_py())).convert("RGB")
+        if img.size != (self.res, self.res):
+            img = img.resize((self.res, self.res), resample=Image.BICUBIC)
+        x = torch.from_numpy(np.array(img)).permute(2, 0, 1)
+        return x.float() / 127.5 - 1.0, int(self.labels[i])
+
+
 def image_source(source, resolution):
-    """`--source cifar10` -> torchvision; anything else -> an image folder."""
+    """`cifar10` -> torchvision, `cifar10-hf` -> the HF mirror, else a folder."""
     if source in TorchvisionImages.SETS:
         return TorchvisionImages(source, resolution)
+    if source in HFParquetImages.SETS:
+        return HFParquetImages(source, resolution)
     return ImageFolderFlat(source, resolution)
 
 
@@ -423,7 +496,9 @@ def main():
     for name in ("latents", "pixels", "refstats"):
         q = sub.add_parser(name)
         q.add_argument("--source", required=True,
-                       help="image root (class subdirs), or 'cifar10'/'cifar100'")
+                       help="image root (class subdirs), 'cifar10'/'cifar100' "
+                            "via torchvision, or 'cifar10-hf' via the HF mirror "
+                            "(same images; use it when cs.toronto.edu is slow)")
         q.add_argument("--dest", required=True)
         q.add_argument("--resolution", type=int, default=256)
         q.add_argument("--batch-size", type=int, default=64)

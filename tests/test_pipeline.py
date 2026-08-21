@@ -522,12 +522,98 @@ def t_pixel_eval_path():
 
 
 # --------------------------------------------------------------------------
+def t_cifar_mirror():
+    """The HF CIFAR mirror must present EXACTLY as torchvision presents.
+
+    `--source cifar10-hf` exists because cs.toronto.edu throttles cloud
+    notebooks to ~100 kB/s. It is only safe because the two sources are
+    interchangeable: same images, and the same `[-1,1]` presentation, so a
+    reference built from either gives identical Inception features.
+
+    The image SET being identical was verified once against the canonical
+    tarball (md5 c58f30108f718f92721af3b95e74349a) and cannot be re-checked
+    without downloading 170 MB. The row order is NOT the same, which leaves FID
+    over the full 50 000 untouched (permutation-invariant) but does re-roll
+    which images a sub-sampled reference or precision/recall sees -- see
+    `HFParquetImages`.
+
+    What IS cheap, and what actually rots, is the presentation arithmetic: if
+    someone edits `TorchvisionImages.__getitem__` and not
+    `HFParquetImages.__getitem__`, every FID computed on a mirror-built
+    reference shifts, and nothing raises. That is what this pins.
+    """
+    try:
+        import pyarrow as pa, pyarrow.parquet as pq
+    except ImportError:
+        print("  SKIP  pyarrow not installed (optional: --source cifar10-hf only)")
+        return
+
+    import io as _io, types
+    from PIL import Image
+    from ddgpu.prepare import HFParquetImages, TorchvisionImages, image_source
+
+    rng = np.random.default_rng(0)
+    raw = rng.integers(0, 256, (8, 32, 32, 3), dtype=np.uint8)
+    blobs = []
+    for a in raw:
+        buf = _io.BytesIO()
+        Image.fromarray(a).save(buf, format="PNG")      # lossless, like the mirror
+        blobs.append(buf.getvalue())
+    tbl = pa.table({"img": pa.array([{"bytes": b, "path": None} for b in blobs],
+                                    type=pa.struct([("bytes", pa.binary()),
+                                                    ("path", pa.string())])),
+                    "label": pa.array(list(range(8)), pa.int64())})
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "train.parquet")
+        pq.write_table(tbl, path)
+        stub = types.ModuleType("huggingface_hub")
+        stub.hf_hub_download = lambda *a, **k: path
+        saved = sys.modules.get("huggingface_hub")
+        sys.modules["huggingface_hub"] = stub
+        try:
+            ds = image_source("cifar10-hf", 32)
+            check("image_source dispatches cifar10-hf to the mirror",
+                  isinstance(ds, HFParquetImages), type(ds).__name__)
+            check("mirror name does not shadow the torchvision one",
+                  "cifar10-hf" not in TorchvisionImages.SETS
+                  and "cifar10" not in HFParquetImages.SETS)
+            check("length and labels survive the round trip",
+                  len(ds) == 8 and ds.labels == list(range(8)),
+                  f"{len(ds)} {ds.labels}")
+
+            # The invariant: identical to TorchvisionImages' own arithmetic.
+            same = all(
+                torch.equal(
+                    ds[i][0],
+                    torch.from_numpy(raw[i]).permute(2, 0, 1).float() / 127.5 - 1.0)
+                for i in range(8))
+            check("presentation matches TorchvisionImages bit-for-bit", same)
+            check("PNG decode is lossless (no pixel drift through the mirror)",
+                  np.array_equal(
+                      np.array(Image.open(_io.BytesIO(blobs[3])).convert("RGB")),
+                      raw[3]))
+            check("labels come back as ints, matching the torchvision contract",
+                  isinstance(ds[0][1], int) and ds.samples[2] == (None, 2),
+                  f"{ds[0][1]!r} {ds.samples[2]}")
+
+            big = HFParquetImages("cifar10-hf", 64)
+            check("resolution resize path works", big[0][0].shape == (3, 64, 64),
+                  str(tuple(big[0][0].shape)))
+        finally:
+            if saved is None:
+                del sys.modules["huggingface_hub"]
+            else:
+                sys.modules["huggingface_hub"] = saved
+
+
+# --------------------------------------------------------------------------
 if __name__ == "__main__":
     for fn in (t_pos_embed_matches_official, t_vp_schedule_roundtrip,
                t_vp_precond_exact_on_gaussian, t_student_grid, t_sigma_sampler,
                t_checkpoint_remap, t_dataset_moments, t_config_delta, t_ema,
                t_lambda_probe, t_vp_precision_at_sigma_max, t_fid_math,
-               t_torchrun_flag_safety, t_pixel_eval_path):
+               t_torchrun_flag_safety, t_pixel_eval_path, t_cifar_mirror):
         print(f"\n== {fn.__name__} ==")
         fn()
     print("\n" + ("ALL PASS" if not FAIL else f"{len(FAIL)} FAILED: {FAIL}"))

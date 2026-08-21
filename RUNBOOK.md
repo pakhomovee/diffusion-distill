@@ -269,33 +269,54 @@ the search moves elsewhere.
 weights — so it answers "do the samples look like images yet" in the time it
 takes to pull the teacher. Reach for it first.
 
-**CIFAR-10 downloads at ~100 kB/s in Colab.** torchvision fetches it from
-cs.toronto.edu, which cloud notebooks see throttled; 170 MB then takes half an
-hour and a reconnected runtime starts over. The Inception weights are *not* the
-problem — those come from GitHub at full speed. Three ways out, in order:
+**Do not download CIFAR-10 from cs.toronto.edu.** That host throttles cloud
+notebooks to ~100 kB/s, so torchvision's 170 MB fetch costs half an hour and a
+reconnected runtime starts from zero. The Inception weights are *not* the
+problem — those come from GitHub at full speed. `--source cifar10-hf`
+(`prepare.HFParquetImages`) reads the same images from `uoft-cs/cifar10` on
+HF's CDN instead: measured **2.4 s vs >10 min** for the train split from the
+same box.
+
+That the two hold the same images was checked rather than assumed — all 50 000
+(image, label) pairs match the canonical tarball (md5
+`c58f30108f718f92721af3b95e74349a`) byte-for-byte, **as a set**. The row order
+differs, so:
+
+* **FID over the full 50 000 is unaffected** — mean and covariance don't care
+  about row order. This is the number in the comparison table.
+* **Subsets are different subsets.** `--n <50000`, and precision/recall (which
+  takes the first k rows), see different images than they would from
+  torchvision — equally valid, different by sampling noise. Use one source per
+  comparison; don't score one arm against a mirror reference and the other
+  against a torchvision one.
+
+`colab_check.py` defaults to the mirror; pass `--ref-source cifar10` to go the
+slow way deliberately. It needs `pyarrow`, which Colab already has.
+
+The mirror is available to the whole pipeline, not just Colab — useful on any
+fresh VM that has no tarball staged:
 
 ```bash
-# 1. Grid only. No reference data is touched.
+python3 -m ddgpu.prepare refstats --source cifar10-hf \
+    --dest "$DD_DATA_ROOT/cifar10" --resolution 32 --n 50000 --gpus 0
+```
+
+Two ways to spend nothing at all:
+
+```bash
+# Grid only — touches no reference data, no CIFAR, no Inception.
 !python3 scripts/colab_check.py --ckpt hf:... --fid-n 0
 
-# 2. Stage the tarball you already have. prepare.find_root honours DD_TV_ROOT,
-#    torchvision md5-checks the archive and skips the download entirely.
-#    (Upload data/cifar-10-python.tar.gz to the HF repo once, from the GPU box.)
-import os, shutil
-from huggingface_hub import hf_hub_download
-p = hf_hub_download("pakhomovee/distill", "cifar-10-python.tar.gz", repo_type="dataset")
-os.makedirs("/content/data", exist_ok=True)
-shutil.copy(p, "/content/data/cifar-10-python.tar.gz")
-os.environ["DD_TV_ROOT"] = "/content/data"
-
-# 3. Skip the images: reuse the reference the training box already computed.
+# Or reuse the reference the training box already computed.
 !python3 scripts/colab_check.py --ckpt hf:... \
     --ref-npz hf:pakhomovee/distill:ref_32_50000.npz
 ```
 
-Either way the computed reference is cached to `--out-dir` as
-`ref_<res>_<n>.npz`, so a second run in the same session is free. Copy it to
-Drive and a *reconnected* session is free too.
+If you do have the tarball to hand, `prepare.find_root` still honours
+`$DD_TV_ROOT` and torchvision will md5-check it and skip the download. Either
+way the computed reference is cached to `--out-dir` as `ref_<res>_<n>.npz`, so a
+second run in the same session is free; copy it to Drive and a *reconnected*
+session is free too.
 
 Serial equivalent on a 1-GPU box (~23 h):
 

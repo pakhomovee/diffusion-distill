@@ -13,13 +13,17 @@ that has never seen the training data.
 all -- no CIFAR-10, no Inception weights -- so it is the fast answer to "do the
 samples look like images yet", which is usually the question.
 
-The reference statistics are rebuilt here from torchvision's CIFAR-10 through
-`ddgpu.prepare` -- the same `image_source` -> `((x+1)*127.5)` -> `inception_feats`
-path that produced them on the training box -- so the FID printed here is
-comparable to `ddgpu.generate`'s rather than merely similar to it. That fetch
-comes from cs.toronto.edu, which cloud notebooks routinely see throttled to
-~100 kB/s; `load_or_build_reference` documents the two ways around it and
-caches the result so a reconnected runtime never pays twice. Sampling
+The reference statistics are rebuilt here through `ddgpu.prepare` -- the same
+`image_source` -> `((x+1)*127.5)` -> `inception_feats` path that produced them
+on the training box -- so the FID printed here is comparable to
+`ddgpu.generate`'s rather than merely similar to it. The images come from the
+HF mirror (`prepare.HFParquetImages`, verified to hold the same 50 000 images
+as the canonical tarball) because cs.toronto.edu throttles cloud notebooks to
+~100 kB/s and the mirror runs at ~50 MB/s. Its row order differs, which leaves
+FID over the full reference untouched but re-rolls which images
+precision/recall sees -- so read P/R from here as indicative, and FID as
+comparable. The result is cached, so a reconnected runtime never pays twice.
+Sampling
 likewise reuses `ddgpu.generate.sample_batch` and `decode` unchanged: a sampler
 that disagrees with the eval path measures a model nobody scored.
 
@@ -84,9 +88,15 @@ def sample_images(G, c, sch, dev, n, batch, seed, use_bf16, vae, scale):
     return torch.cat(out)
 
 
-def reference_feats(inc, dev, n, resolution, batch):
-    """Rebuild the FID reference from torchvision, matching `prepare.cmd_refstats`."""
-    ds = image_source("cifar10", resolution)
+def reference_feats(inc, dev, n, resolution, batch, source="cifar10-hf"):
+    """Rebuild the FID reference, matching `prepare.cmd_refstats` exactly.
+
+    Defaults to the HF mirror rather than torchvision: the same 50 000 images,
+    verified byte-for-byte as a set, but ~50 MB/s instead of the ~100 kB/s
+    cs.toronto.edu gives a cloud notebook. Row order differs; see
+    `prepare.HFParquetImages` for what that does and does not affect.
+    """
+    ds = image_source(source, resolution)
     n = min(n, len(ds))
     # Evenly spaced, not a prefix: cmd_refstats does the same so that every
     # class is represented rather than the first few thousand.
@@ -112,14 +122,13 @@ def load_or_build_reference(a, inc, dev, resolution):
     In order: an existing refstats `.npz` (`--ref-npz`, local or `hf:`), this
     run's own cache, then a fresh pass over torchvision's CIFAR-10.
 
-    The cache matters more than it looks. torchvision fetches CIFAR-10 from
-    cs.toronto.edu, which is routinely throttled to ~100 kB/s from cloud
-    notebooks -- 170 MB then takes half an hour, and a disconnected runtime
-    starts over. Two escapes, both cheaper than waiting:
-      * stage the tarball yourself and point `$DD_TV_ROOT` at its directory;
-        torchvision md5-checks it and skips the download (`prepare.find_root`);
-      * pass `--ref-npz`, the same `ref_<res>_<n>.npz` `eval_all.sh` scores
-        against, so the reference is byte-identical to the training box's.
+    The default source is already the fast one -- `prepare.HFParquetImages`,
+    the HF mirror of the same images -- so the half-hour cs.toronto.edu fetch
+    only happens if you ask for it with `--ref-source cifar10`. Two further
+    ways to spend nothing at all:
+      * `--ref-npz`, the same `ref_<res>_<n>.npz` `eval_all.sh` scores against,
+        making the reference byte-identical to the training box's;
+      * the cache written below, which survives anything but a new runtime.
     """
     if a.ref_npz:
         path = resolve_ckpt(a.ref_npz) if a.ref_npz.startswith("hf:") else a.ref_npz
@@ -138,7 +147,7 @@ def load_or_build_reference(a, inc, dev, resolution):
         print(f"[colab] reference from cache {cache}: {tuple(f.shape)}")
         return f
 
-    f = reference_feats(inc, dev, a.ref_n, resolution, a.batch)
+    f = reference_feats(inc, dev, a.ref_n, resolution, a.batch, a.ref_source)
     np.savez(cache, feats=f.numpy().astype(np.float32), resolution=resolution,
              n=len(f))
     print(f"[colab] reference cached -> {cache} (keep it; re-running is then free)")
@@ -155,6 +164,10 @@ def main():
     p.add_argument("--fid-n", type=int, default=10000,
                    help="generated samples for FID; 0 skips scoring entirely")
     p.add_argument("--ref-n", type=int, default=50000, help="real images in the reference")
+    p.add_argument("--ref-source", default="cifar10-hf",
+                   choices=["cifar10-hf", "cifar10"],
+                   help="cifar10-hf is the HF mirror (~50 MB/s, same images as "
+                        "the tarball); cifar10 goes to cs.toronto.edu (~100 kB/s)")
     p.add_argument("--ref-npz", default=None,
                    help="reuse a refstats .npz instead of rebuilding from "
                         "torchvision; local path or hf:<repo_id>:<path/in/repo>")
@@ -237,6 +250,8 @@ def main():
     rec_out = dict(ckpt=a.ckpt, weights=a.weights, step=ck.get("it"),
                    mode=c.get("mode"), nfe=c["n_student_steps"],
                    n_fake=int(len(f_fake)), n_real=int(len(f_real)),
+                   # Provenance: P/R is only comparable against the same source.
+                   ref_source=a.ref_npz or a.ref_source,
                    precision=a.precision, fid=float(fid),
                    prec=float(prec), recall=float(rec))
     json.dump(rec_out, open(f"{a.out_dir}/score.json", "w"), indent=1)
