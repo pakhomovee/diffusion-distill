@@ -30,6 +30,7 @@ for free, where reaching the same place by training means driving eps_hat's
 error down by the same factor.
 """
 import argparse
+import json
 import os
 import sys
 
@@ -73,6 +74,29 @@ def hf_power(x):
     yy, xx = np.mgrid[:F.shape[0], :F.shape[1]]
     return F[np.hypot(yy - cy, xx - cx) >= F.shape[0] * 0.44].mean() / (
         x.shape[1] * x.shape[2])
+
+
+def run_sigma_max(grid_path):
+    """The sigma_max the run beside this grid was TRAINED at, or None.
+
+    Not a convenience. The whole eps_hat calculation divides by this number, so
+    a default that silently disagrees with the run reports the network as more
+    accurate than it is -- a run trained at sigma_max=40 and read with the VP
+    default of 157.4 comes out 3.9x too flattering, which is exactly the size of
+    the effect being tested. `train.py` writes config.resolved.json into the run
+    directory for this reason: every run records what it actually ran with.
+    """
+    d = os.path.dirname(os.path.abspath(grid_path))
+    for _ in range(2):                      # the grid may sit one level down
+        p = os.path.join(d, "config.resolved.json")
+        if os.path.exists(p):
+            try:
+                v = json.load(open(p)).get("sigma_max")
+            except (ValueError, OSError):
+                return None
+            return float(v) if isinstance(v, (int, float)) else None
+        d = os.path.dirname(d)
+    return None
 
 
 def mean_delta_z(fake, real):
@@ -126,8 +150,9 @@ def main():
     p.add_argument("--tile", type=int, default=32, help="one image's size in the grid")
     p.add_argument("--source", default="cifar10-hf", help="real images to compare to")
     p.add_argument("--n-real", type=int, default=5000)
-    p.add_argument("--sigma-max", type=float, default=157.40728081040757,
-                   help="the sigma a one-step VP student starts from")
+    p.add_argument("--sigma-max", type=float, default=None,
+                   help="the sigma a one-step student starts from; default: read "
+                        "from the run's config.resolved.json beside the grid")
     p.add_argument("--sigma-data", type=float, default=0.5)
     a = p.parse_args()
 
@@ -135,6 +160,18 @@ def main():
     real = real_images(a.source, a.tile, a.n_real)
     print(f"[stats] {len(fake)} samples from {a.grid} vs {len(real)} real "
           f"from {a.source}")
+
+    if a.sigma_max is None:
+        a.sigma_max = run_sigma_max(a.grid)
+        if a.sigma_max is None:
+            a.sigma_max = 157.40728081040757
+            print(f"[stats] no config.resolved.json beside the grid; assuming "
+                  f"sigma_max={a.sigma_max:.3f} (the VP default). If the run "
+                  "used another,\n        pass --sigma-max: every eps_hat "
+                  "number below scales with it.")
+        else:
+            print(f"[stats] sigma_max={a.sigma_max:.3f}, from the run's "
+                  "config.resolved.json")
 
     print("\n-- is the layout sane? (a dimension bug destroys these) --")
     nf, nr = neighbour_corr(fake), neighbour_corr(real)
@@ -206,9 +243,11 @@ def main():
               "less.")
 
     print("\n-- amplification: the same eps_hat error at a lower start sigma --")
+    seen = set()
     for s in (a.sigma_max, 80.0, 40.0, 20.0, 10.0):
-        if s > a.sigma_max:
+        if s > a.sigma_max or round(s, 6) in seen:
             continue
+        seen.add(round(s, 6))
         print(f"   sigma_max {s:8.3f} -> {s*err*127.5:5.1f} levels of grain, "
               f"SNR vs sigma_data {a.sigma_data/(s*err):6.1f}")
     print("   (error in the image is LINEAR in the sigma a one-step student starts\n"
