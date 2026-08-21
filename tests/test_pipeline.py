@@ -522,6 +522,71 @@ def t_pixel_eval_path():
 
 
 # --------------------------------------------------------------------------
+def t_sample_stats_significance():
+    """A colour cast measured from 64 images must be scored against 64 images.
+
+    `scripts/sample_stats.py` compares a 64-image grid to thousands of real
+    ones. The first version divided the mean difference by the REAL side's
+    standard error only (~0.5 levels at n=5000), ignoring the fake side's (~4
+    levels at n=64) -- reporting a 3-sigma cast as 30-sigma. The number is read
+    as evidence about a training run, so it has to be right.
+
+    Ground truth here is exact: draw both sides from known Gaussians, where the
+    true standard error of each mean is sigma/sqrt(n) by construction.
+    """
+    sys.path.insert(0, os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+    from sample_stats import mean_delta_z
+
+    rng = np.random.default_rng(0)
+    n_f, n_r, spread, shift = 64, 5000, 32.0, 10.0
+    # Per-image mean is what carries the uncertainty; give each image a constant
+    # value so the image mean IS the draw and the truth is unambiguous.
+    fake = np.repeat(rng.normal(120 + shift, spread, n_f), 32 * 32 * 3)
+    fake = fake.reshape(n_f, 32, 32, 3).astype(np.float32)
+    real = np.repeat(rng.normal(120.0, spread, n_r), 32 * 32 * 3)
+    real = real.reshape(n_r, 32, 32, 3).astype(np.float32)
+
+    d, se, se_f, se_r = mean_delta_z(fake, real)
+    check("se_fake matches sigma/sqrt(n_fake)",
+          abs(float(se_f[0]) - spread / math.sqrt(n_f)) < 0.5,
+          f"{float(se_f[0]):.2f} vs {spread / math.sqrt(n_f):.2f}")
+    check("se_real matches sigma/sqrt(n_real)",
+          abs(float(se_r[0]) - spread / math.sqrt(n_r)) < 0.1,
+          f"{float(se_r[0]):.3f} vs {spread / math.sqrt(n_r):.3f}")
+    check("the fake side dominates the combined se at grid sizes",
+          float(se_f[0]) > 5 * float(se_r[0]),
+          f"{float(se_f[0]):.2f} vs {float(se_r[0]):.2f}")
+    check("combined se adds the two in quadrature",
+          abs(float(se[0]) - math.hypot(float(se_f[0]), float(se_r[0]))) < 1e-4)
+
+    z_bad = float(d[0] / se_r[0])
+    check("the old real-only divisor really was ~an order of magnitude high",
+          z_bad > 5 * abs(float(d[0] / se[0])),
+          f"real-only z {z_bad:.1f} vs correct {float(d[0] / se[0]):.1f}")
+
+    # Calibration is the real test, and a single draw cannot show it: with 64
+    # images the realised mean scatters by spread/8 = 4 levels, so one z tells
+    # us nothing. Under the null z must be standard normal -- std 1. A se that
+    # ignores the fake side inflates that std by ~ se_real/se_combined.
+    def z_null(rep):
+        g = np.random.default_rng(rep)
+        f = np.repeat(g.normal(120.0, spread, n_f), 2 * 2 * 3).reshape(n_f, 2, 2, 3)
+        r = np.repeat(g.normal(120.0, spread, n_r), 2 * 2 * 3).reshape(n_r, 2, 2, 3)
+        dd, ss, _, rr = mean_delta_z(f.astype(np.float32), r.astype(np.float32))
+        return float(dd[0] / ss[0]), float(dd[0] / rr[0])
+
+    zs, bad = zip(*[z_null(i) for i in range(200)])
+    zs, bad = np.array(zs), np.array(bad)
+    check("under the null, z is standard normal (std ~ 1)",
+          abs(zs.std() - 1.0) < 0.2, f"std {zs.std():.2f}, mean {zs.mean():+.2f}")
+    check("the real-only divisor is badly miscalibrated under the null",
+          bad.std() > 4.0, f"std {bad.std():.1f} (should be ~1)")
+    check("a true shift is detected", abs(float(d[0] / se[0])) > 2.0,
+          f"z {float(d[0] / se[0]):.2f} for a {shift:.0f}-level shift")
+
+
+# --------------------------------------------------------------------------
 def t_dataset_dir_errors():
     """A wrong --data path must say which wrong thing it is.
 
@@ -664,7 +729,7 @@ if __name__ == "__main__":
                t_checkpoint_remap, t_dataset_moments, t_config_delta, t_ema,
                t_lambda_probe, t_vp_precision_at_sigma_max, t_fid_math,
                t_torchrun_flag_safety, t_pixel_eval_path, t_cifar_mirror,
-               t_dataset_dir_errors):
+               t_dataset_dir_errors, t_sample_stats_significance):
         print(f"\n== {fn.__name__} ==")
         fn()
     print("\n" + ("ALL PASS" if not FAIL else f"{len(FAIL)} FAILED: {FAIL}"))

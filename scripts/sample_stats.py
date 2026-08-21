@@ -75,6 +75,23 @@ def hf_power(x):
         x.shape[1] * x.shape[2])
 
 
+def mean_delta_z(fake, real):
+    """Per-channel mean difference, and how many standard errors it is.
+
+    The uncertainty lives on BOTH sides, and at a typical grid size it is almost
+    entirely the FAKE side: se over 5000 real images is ~0.5 levels, se over 64
+    generated ones is ~4. Dividing by the real side alone -- which this did at
+    first -- overstates the significance by an order of magnitude, turning a
+    3-sigma colour cast into a reported 30-sigma one.
+
+    Returns (delta, combined_se, se_fake, se_real), all per channel.
+    """
+    d = fake.mean((0, 1, 2)) - real.mean((0, 1, 2))
+    se_f = fake.mean((1, 2)).std(0) / np.sqrt(len(fake))
+    se_r = real.mean((1, 2)).std(0) / np.sqrt(len(real))
+    return d, np.sqrt(se_f ** 2 + se_r ** 2), se_f, se_r
+
+
 def hf_null(real, n, seed=0):
     """hf_power over random real subsets of the grid's own size.
 
@@ -135,9 +152,10 @@ def main():
 
     print("\n-- colour --")
     mf, mr = fake.mean((0, 1, 2)), real.mean((0, 1, 2))
-    se = real.mean((1, 2)).std(0) / np.sqrt(len(real))
-    d = mf - mr
+    d, se, se_f, se_r = mean_delta_z(fake, real)
     print(f"   channel mean  fake {np.round(mf,1)}  real {np.round(mr,1)}")
+    print(f"   se: fake(n={len(fake)}) {np.round(se_f,2)}  "
+          f"real(n={len(real)}) {np.round(se_r,2)}  combined {np.round(se,2)}")
     print(f"   delta {np.round(d,1)} levels = {np.round(d/se,1)} standard errors")
 
     print("\n-- diversity (std across images of each image's mean) --")
