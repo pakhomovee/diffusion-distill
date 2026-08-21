@@ -17,6 +17,7 @@ scripts/
   precision_probe.py  noise each precision puts into D(x;sigma), per teacher/GPU
   colab_check.py  grid + FID for one checkpoint, on a box with no training data
   sample_stats.py what KIND of wrong a sample grid is: noise / blur / layout / collapse
+  teacher_sample.py multi-step Heun sample of the TEACHER -- the ceiling, before distilling
   train.sh        single entry point for a training run
   eval_all.sh     score every run and print the matched-wall-clock table
   mkconfig.py     generates run configs (they are not hand-maintained -- see below)
