@@ -16,6 +16,7 @@ scripts/
   progress.py     progress + ETA for every run, read off the logs already on disk
   precision_probe.py  noise each precision puts into D(x;sigma), per teacher/GPU
   colab_check.py  grid + FID for one checkpoint, on a box with no training data
+  sample_stats.py what KIND of wrong a sample grid is: noise / blur / layout / collapse
   train.sh        single entry point for a training run
   eval_all.sh     score every run and print the matched-wall-clock table
   mkconfig.py     generates run configs (they are not hand-maintained -- see below)
