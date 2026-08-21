@@ -228,6 +228,39 @@ reason the smoke script exists.
   also unaffected: `exp/10_lambda_real.py` and `validate_teacher` never
   autocast.
 
+- **Fixing the arithmetic does not fix the conditioning, and the conditioning is
+  the bigger problem.** The bullet above is about *rounding*; this one is about
+  what remains when rounding is gone. `D = x − σ·ε̂` amplifies **any** error in
+  `ε̂` by σ, whatever its source — rounding, bias, or simply not having trained
+  long enough. At σ_max = 157.4 that is a factor of 157; EDM's `c_out` at the
+  same σ is σ_data = 0.5, so **the VP parameterisation demands ~315× more
+  relative accuracy from the network for the same picture**:
+
+  | target image SNR | noise in `D` | VP: error in `ε̂` | EDM: error in `F` |
+  |---|---|---|---|
+  | 1  | 0.500  | 3.2e-03 | 1.0e+00 |
+  | 10 | 0.050  | 3.2e-04 | 1.0e-01 |
+  | 30 | 0.017  | 1.1e-04 | 3.3e-02 |
+
+  Measured on the first post-guard CIFAR grid (`scripts/sample_stats.py`): the
+  student's `ε̂` is accurate to **6.6e-4**, giving image SNR **4.8** — grainy,
+  structureless, and a systematic colour cast from a ~1.1e-3 *bias* in `ε̂`
+  arriving as 15–30 levels. The network is not bad: behind EDM preconditioning
+  that same 6.6e-4 would give SNR ~1500. It is the parameterisation that is
+  expensive, and it is expensive in a way that **hurts both arms equally** —
+  which is exactly why the first programme's two arms agreed to within 1 FID
+  point of each other at FID ~325. A common-mode error this large swamps the
+  treatment effect the experiment exists to measure.
+
+  Three ways out, cheapest first. (a) **Lower σ_max**: error in the image is
+  linear in the σ a one-step student starts from, so `--set sigma_max=40` cuts
+  the grain 4× for nothing. It is a retrain, not a re-score — σ_max is where
+  the generator is *trained*. (b) **Use an EDM CIFAR teacher** instead of
+  `diffusers:google/ddpm-cifar10-32`; `edm:` is already a supported family
+  (Phase D uses it) and removes the amplification by construction, at the cost
+  of an NVlabs/edm clone and a `.pkl`. (c) **Train longer** — SNR 30 needs `ε̂`
+  6× more accurate than it is now, which is the worst value of the three.
+
 - **A teacher wrapped in the wrong preconditioning raises nothing.** Four
   families share one trainer (VP ε, EDM denoiser, interpolant velocity,
   synthetic). `validate_teacher` is what notices: `rel_mse` should be ~0 at
