@@ -265,6 +265,38 @@ and off, and prints the mean difference. Off is the old bf16 failure; if the two
 grids are indistinguishable, precision is *not* what is wrong with the run and
 the search moves elsewhere.
 
+**`--fid-n 0` needs no reference data at all** — no CIFAR-10, no Inception
+weights — so it answers "do the samples look like images yet" in the time it
+takes to pull the teacher. Reach for it first.
+
+**CIFAR-10 downloads at ~100 kB/s in Colab.** torchvision fetches it from
+cs.toronto.edu, which cloud notebooks see throttled; 170 MB then takes half an
+hour and a reconnected runtime starts over. The Inception weights are *not* the
+problem — those come from GitHub at full speed. Three ways out, in order:
+
+```bash
+# 1. Grid only. No reference data is touched.
+!python3 scripts/colab_check.py --ckpt hf:... --fid-n 0
+
+# 2. Stage the tarball you already have. prepare.find_root honours DD_TV_ROOT,
+#    torchvision md5-checks the archive and skips the download entirely.
+#    (Upload data/cifar-10-python.tar.gz to the HF repo once, from the GPU box.)
+import os, shutil
+from huggingface_hub import hf_hub_download
+p = hf_hub_download("pakhomovee/distill", "cifar-10-python.tar.gz", repo_type="dataset")
+os.makedirs("/content/data", exist_ok=True)
+shutil.copy(p, "/content/data/cifar-10-python.tar.gz")
+os.environ["DD_TV_ROOT"] = "/content/data"
+
+# 3. Skip the images: reuse the reference the training box already computed.
+!python3 scripts/colab_check.py --ckpt hf:... \
+    --ref-npz hf:pakhomovee/distill:ref_32_50000.npz
+```
+
+Either way the computed reference is cached to `--out-dir` as
+`ref_<res>_<n>.npz`, so a second run in the same session is free. Copy it to
+Drive and a *reconnected* session is free too.
+
 Serial equivalent on a 1-GPU box (~23 h):
 
 ```bash

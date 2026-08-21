@@ -9,10 +9,17 @@ self-contained: no run directory, no `config.resolved.json`, no prepared
 dataset, no reference `.npz`. That is the whole reason this can run on a box
 that has never seen the training data.
 
+`--fid-n 0` renders the grid and nothing else. That needs no reference data at
+all -- no CIFAR-10, no Inception weights -- so it is the fast answer to "do the
+samples look like images yet", which is usually the question.
+
 The reference statistics are rebuilt here from torchvision's CIFAR-10 through
 `ddgpu.prepare` -- the same `image_source` -> `((x+1)*127.5)` -> `inception_feats`
 path that produced them on the training box -- so the FID printed here is
-comparable to `ddgpu.generate`'s rather than merely similar to it. Sampling
+comparable to `ddgpu.generate`'s rather than merely similar to it. That fetch
+comes from cs.toronto.edu, which cloud notebooks routinely see throttled to
+~100 kB/s; `load_or_build_reference` documents the two ways around it and
+caches the result so a reconnected runtime never pays twice. Sampling
 likewise reuses `ddgpu.generate.sample_batch` and `decode` unchanged: a sampler
 that disagrees with the eval path measures a model nobody scored.
 
@@ -99,6 +106,45 @@ def reference_feats(inc, dev, n, resolution, batch):
     return torch.cat(feats)
 
 
+def load_or_build_reference(a, inc, dev, resolution):
+    """Reference features, from the cheapest source that is actually available.
+
+    In order: an existing refstats `.npz` (`--ref-npz`, local or `hf:`), this
+    run's own cache, then a fresh pass over torchvision's CIFAR-10.
+
+    The cache matters more than it looks. torchvision fetches CIFAR-10 from
+    cs.toronto.edu, which is routinely throttled to ~100 kB/s from cloud
+    notebooks -- 170 MB then takes half an hour, and a disconnected runtime
+    starts over. Two escapes, both cheaper than waiting:
+      * stage the tarball yourself and point `$DD_TV_ROOT` at its directory;
+        torchvision md5-checks it and skips the download (`prepare.find_root`);
+      * pass `--ref-npz`, the same `ref_<res>_<n>.npz` `eval_all.sh` scores
+        against, so the reference is byte-identical to the training box's.
+    """
+    if a.ref_npz:
+        path = resolve_ckpt(a.ref_npz) if a.ref_npz.startswith("hf:") else a.ref_npz
+        if not os.path.exists(path):
+            raise SystemExit(f"no such reference: {path}")
+        f = torch.from_numpy(np.load(path)["feats"]).float()
+        if f.ndim != 2 or f.shape[1] != 2048:
+            raise SystemExit(f"{path} holds {tuple(f.shape)}; expected (N, 2048) "
+                             "pool3 features from `ddgpu.prepare refstats`")
+        print(f"[colab] reference from {path}: {tuple(f.shape)}")
+        return f
+
+    cache = f"{a.out_dir}/ref_{resolution}_{a.ref_n}.npz"
+    if os.path.exists(cache):
+        f = torch.from_numpy(np.load(cache)["feats"]).float()
+        print(f"[colab] reference from cache {cache}: {tuple(f.shape)}")
+        return f
+
+    f = reference_feats(inc, dev, a.ref_n, resolution, a.batch)
+    np.savez(cache, feats=f.numpy().astype(np.float32), resolution=resolution,
+             n=len(f))
+    print(f"[colab] reference cached -> {cache} (keep it; re-running is then free)")
+    return f
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--ckpt", required=True,
@@ -109,6 +155,9 @@ def main():
     p.add_argument("--fid-n", type=int, default=10000,
                    help="generated samples for FID; 0 skips scoring entirely")
     p.add_argument("--ref-n", type=int, default=50000, help="real images in the reference")
+    p.add_argument("--ref-npz", default=None,
+                   help="reuse a refstats .npz instead of rebuilding from "
+                        "torchvision; local path or hf:<repo_id>:<path/in/repo>")
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--precision", default="bf16", choices=["bf16", "fp32"],
@@ -180,7 +229,7 @@ def main():
 
     inc = build_inception(dev)
     f_fake = inception_feats(inc, imgs[:a.fid_n], dev, a.batch)
-    f_real = reference_feats(inc, dev, a.ref_n, c["shape"][-1], a.batch)
+    f_real = load_or_build_reference(a, inc, dev, c["shape"][-1])
     fid = fid_from_feats(f_real, f_fake)
     k = min(10000, len(f_real), len(f_fake))
     prec, rec = precision_recall(f_real[:k], f_fake[:k])
