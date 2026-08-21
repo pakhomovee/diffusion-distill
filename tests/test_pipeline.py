@@ -522,6 +522,56 @@ def t_pixel_eval_path():
 
 
 # --------------------------------------------------------------------------
+def t_dataset_dir_errors():
+    """A wrong --data path must say which wrong thing it is.
+
+    This trap has bitten twice. Once as `/cifar10`, an unset $DD_DATA_ROOT
+    expanding into a plausible absolute path. Once as an HF *download cache*
+    passed to --data: the directory exists, so the isdir guard passes, and with
+    no meta.json the loader assumed a legacy latent dir and reported a missing
+    `train_moments.npy` -- sending the reader after a VAE problem they do not
+    have. Both waste the same half hour, and neither raises where the mistake
+    was made.
+
+    Legacy latent directories genuinely predate meta.json and must keep
+    loading, so the discriminator cannot be meta.json alone; it has to be
+    whether any dataset file is present at all.
+    """
+    from ddgpu.data import build_dataset
+
+    missing = "/definitely/not/here/cifar10"
+    try:
+        build_dataset(dict(data=missing, shape=[3, 32, 32], n_classes=1))
+        check("nonexistent dir is refused", False)
+    except FileNotFoundError as e:
+        m = str(e)
+        check("nonexistent dir names the unset-variable case",
+              "does not exist" in m and "DD_DATA_ROOT" in m)
+
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "blobs"))
+        os.makedirs(os.path.join(d, "snapshots"))
+        try:
+            build_dataset(dict(data=d, shape=[3, 32, 32], n_classes=1))
+            check("a non-dataset directory is refused", False)
+        except FileNotFoundError as e:
+            m = str(e)
+            check("existing non-dataset dir says so, not 'no train_moments.npy'",
+                  "not a prepared dataset" in m)
+            check("it lists what the directory actually holds", "it contains:" in m)
+            check("it points at prepare and at the --data shortcut",
+                  "ddgpu.prepare pixels" in m and "cifar10-hf" in m)
+
+    with tempfile.TemporaryDirectory() as d:
+        np.save(os.path.join(d, "train_latents.npy"),
+                np.zeros((4, 4, 8, 8), np.float32))
+        np.save(os.path.join(d, "train_labels.npy"), np.zeros((4,), np.int64))
+        ds, _ = build_dataset(dict(data=d, shape=[4, 8, 8], n_classes=1))
+        check("legacy latent dirs (no meta.json) still load", len(ds) == 4,
+              f"{len(ds)} items")
+
+
+# --------------------------------------------------------------------------
 def t_cifar_mirror():
     """The HF CIFAR mirror must present EXACTLY as torchvision presents.
 
@@ -613,7 +663,8 @@ if __name__ == "__main__":
                t_vp_precond_exact_on_gaussian, t_student_grid, t_sigma_sampler,
                t_checkpoint_remap, t_dataset_moments, t_config_delta, t_ema,
                t_lambda_probe, t_vp_precision_at_sigma_max, t_fid_math,
-               t_torchrun_flag_safety, t_pixel_eval_path, t_cifar_mirror):
+               t_torchrun_flag_safety, t_pixel_eval_path, t_cifar_mirror,
+               t_dataset_dir_errors):
         print(f"\n== {fn.__name__} ==")
         fn()
     print("\n" + ("ALL PASS" if not FAIL else f"{len(FAIL)} FAILED: {FAIL}"))

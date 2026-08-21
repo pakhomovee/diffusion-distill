@@ -169,6 +169,19 @@ python3 -m ddgpu.teachers --teacher diffusers:google/ddpm-cifar10-32 \
     --data "$DD_DATA_ROOT/cifar10"
 ```
 
+`--data` also accepts a **source name** instead of a prepared directory, which
+is the fast path on a box where nothing has been prepared yet (Colab, a new VM):
+
+```bash
+python3 -m ddgpu.teachers --teacher diffusers:google/ddpm-cifar10-32 \
+    --data cifar10-hf
+```
+
+Pixel teachers only — a latent teacher needs the VAE-encoded dataset. Pointing
+`--data` at a raw *download cache* (e.g. `~/.cache/huggingface/hub/datasets--...`)
+is not the same thing as a prepared dataset directory and is now refused by
+name rather than reported as a missing `train_moments.npy`.
+
 Want: `"verdict": "OK"`, `identity_err` ~1e-11, `rel_mse@0.01` ≈ 0 rising toward
 1 at `rel_mse@100`. **Flat and near 1 everywhere = wrong noise convention**, and
 nothing downstream is trustworthy. This is the first time `validate_teacher`

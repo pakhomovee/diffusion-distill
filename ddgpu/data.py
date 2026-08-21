@@ -181,8 +181,27 @@ def build_dataset(c):
         ds = PixelDataset(root, flip=flip)
     else:
         if not meta:
-            # Legacy latent dirs predate meta.json and are still supported, so
-            # this is a note on the way past, not a refusal.
+            # Legacy latent dirs predate meta.json and are still supported, so a
+            # missing meta.json alone is a note on the way past, not a refusal.
+            # But a directory with no meta.json AND no data files is simply not a
+            # prepared dataset -- usually a raw download cache or the wrong path.
+            # Falling through to LatentDataset there reports a missing
+            # `train_moments.npy`, which sends the reader looking for a VAE
+            # problem they do not have.
+            have = [f for f in ("train_moments.npy", "train_latents.npy",
+                                "train_pixels.npy") if os.path.exists(f"{root}/{f}")]
+            if not have:
+                listing = sorted(os.listdir(root))[:8]
+                raise FileNotFoundError(
+                    f"{root} is not a prepared dataset: no meta.json, and no "
+                    f"train_pixels.npy / train_moments.npy / train_latents.npy.\n"
+                    f"  it contains: {listing}{' ...' if len(listing) == 8 else ''}\n"
+                    "  A raw download cache is not a dataset directory. Prepare "
+                    "one first:\n"
+                    "    python3 -m ddgpu.prepare pixels --source cifar10-hf "
+                    "--dest <dir> --resolution 32\n"
+                    "  and pass <dir> here. To validate a teacher you can skip "
+                    "this entirely and\n  pass a source name: --data cifar10-hf")
             print(f"[data] no meta.json in {root}; reading it as a LATENT dataset")
         ds = LatentDataset(root, flip=flip)
     resolved = {}

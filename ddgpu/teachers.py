@@ -473,7 +473,10 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(description="Load and validate a teacher")
     p.add_argument("--teacher", required=True, help="<family>:<path>")
-    p.add_argument("--data", default=None, help="dataset dir for the validation batch")
+    p.add_argument("--data", default=None,
+                   help="prepared dataset dir, OR a source name ('cifar10-hf', "
+                        "'cifar10') to pull the validation batch straight from "
+                        "the images with nothing prepared")
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--repa-dir", default=None)
     p.add_argument("--edm-repo", default=None)
@@ -483,9 +486,24 @@ if __name__ == "__main__":
     m, meta = load_teacher(a.teacher, device=dev, **kwargs)
     print(json.dumps(meta, indent=1, default=str))
     if a.data:
-        from .data import build_dataset
-        ds, _ = build_dataset(dict(data=a.data, shape=meta["shape"],
-                                   n_classes=meta["n_classes"]))
+        # `validate_teacher` only wants a batch of real images in [-1,1]. If the
+        # user names a source rather than a prepared directory, read the images
+        # directly -- preparing a whole dataset to check a teacher is a large
+        # detour, and on an ephemeral box it is the reason the check gets
+        # skipped. Pixel teachers only: a latent teacher needs the VAE-encoded
+        # dataset that `prepare latents` writes.
+        from .prepare import TorchvisionImages, HFParquetImages, image_source
+        if a.data in TorchvisionImages.SETS or a.data in HFParquetImages.SETS:
+            if meta.get("space") != "pixel":
+                raise SystemExit(
+                    f"--data {a.data} reads raw images, but {a.teacher} works in "
+                    f"{meta.get('space')} space; point --data at the prepared "
+                    "latent dataset instead.")
+            ds = image_source(a.data, meta["shape"][-1])
+        else:
+            from .data import build_dataset
+            ds, _ = build_dataset(dict(data=a.data, shape=meta["shape"],
+                                       n_classes=meta["n_classes"]))
         xb = torch.stack([ds[i][0] for i in range(a.batch)])
         yb = torch.tensor([ds[i][1] for i in range(a.batch)])
         print(json.dumps(validate_teacher(m, xb, yb.to(dev), device=dev), indent=1))
