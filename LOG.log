@@ -1141,6 +1141,36 @@ anyway: the `robust` arm sets gan_weight=0 and has no discriminator at all. If
 it collapses the same way, (B) is out and the fault is in the DM dynamics; if
 it does not, the GAN is implicated. Either answer is worth 6.5 GPU-h.
 
+A structural fact that makes (B) more likely, and that the programme as planned
+cannot check. DMD2's discriminator is a thin head on the CRITIC'S OWN features:
+`GANHead` reads `net.trunk() -> (tokens, cond)`, so its feature extractor is the
+critic diffusion model itself, continuously trained on the generator's
+distribution. `trunk()` is defined in exactly one place in this repo --
+`ddgpu/dit.py:140`, our own DiT. Not on `DiffusersUNetAdapter`, not on
+`EDMPklDenoiser`, not on the REPA SiT. So the dispatch in `DMD2Trainer.__init__`
+falls through to `ConvGANHead` for every cheap-tier teacher, and the cheap tier
+is the whole programme being run. DMD2's actual discriminator is exercised only
+in the DEFERRED ImageNet-256 tier.
+
+What the baseline actually trains against on CIFAR is therefore a 3.0M-parameter
+standalone conv net on raw 32x32 pixels (four stride-2 blocks, 64->512, FiLM on
+log sigma) -- a conventional DCGAN-style discriminator, and it is winning
+(loss_gan_d 0.60 against 1.0 for an uninformative hinge). Conventional pixel
+discriminators that win are a classic cause of exactly the precision-up/
+recall-down trajectory above.
+
+RUNPLAN section 6 argues the substitution is safe because "the baseline and the
+method arms use the identical head, and the method arm's whole point is that it
+uses no head at all". That holds only if the substitute is a FAITHFUL stand-in.
+If it is what collapses the baseline, then "Track A beats DMD2" degrades to
+"Track A beats a broken DMD2 variant" -- the strawman ENTRY 003 set out to
+avoid. This is a threat to the headline claim, not a cosmetic deviation, and it
+has to be settled before Phase C is worth running.
+
+To be clear about what is and is not the contribution: ConvGANHead is BASELINE
+scaffolding. Track A proposes no discriminator at all. The substitution damages
+the comparison, not the method.
+
 Not yet ruled out: that precision/recall itself misbehaves here. Nothing in the
 repo had ever scored a model known to be good, so `scripts/teacher_sample.py
 --fid-n` now exists to score the teacher through the identical reference,
