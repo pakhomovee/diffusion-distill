@@ -30,6 +30,7 @@ teacher's own sigma grid (`VPSchedule.student_sigmas` for VP teachers, the
 rho=7 EDM grid otherwise) so the noise levels are ones it was trained on.
 """
 import argparse
+import json
 import os
 import sys
 
@@ -50,7 +51,7 @@ def sigma_grid(G, steps, sigma_max, device):
 
 
 @torch.no_grad()
-def heun(G, n, shape, sigmas, device, gen, n_classes=1):
+def heun(G, n, shape, sigmas, device, gen, n_classes=1, verbose=True):
     """Karras Algorithm 1, deterministic (S_churn = 0)."""
     x = torch.randn(n, *shape, device=device, generator=gen) * float(sigmas[0])
     y = torch.randint(0, max(n_classes, 1), (n,), device=device, generator=gen)
@@ -63,7 +64,7 @@ def heun(G, n, shape, sigmas, device, gen, n_classes=1):
             d2 = (x2 - G(x2, full(s1), y)) / s1
             x2 = x + (s1 - s) * 0.5 * (d + d2)
         x = x2
-        if (i + 1) % 10 == 0:
+        if verbose and (i + 1) % 10 == 0:
             print(f"[teacher] step {i+1}/{len(sigmas)-1}  sigma {s1:.3f}", flush=True)
     return x
 
@@ -80,7 +81,19 @@ def main():
                    help="default: the teacher's own")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--out", default="teacher_samples.png")
+    p.add_argument("--batch", type=int, default=64)
+    p.add_argument("--fid-n", type=int, default=0,
+                   help="also score the teacher against --ref. This is the "
+                        "CEILING: a student cannot beat it, and if the teacher's "
+                        "own recall is near zero the metric is what is broken, "
+                        "not the student.")
+    p.add_argument("--ref", default=None,
+                   help="ref_<res>_<n>.npz from `ddgpu.prepare refstats`; "
+                        "required by --fid-n")
     a = p.parse_args()
+    if a.fid_n > 0 and not a.ref:
+        raise SystemExit("--fid-n needs --ref (the same .npz ddgpu.generate scores "
+                         "against, so the two numbers are comparable)")
 
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     kw = {k: v for k, v in (("edm_repo", a.edm_repo), ("repa_dir", a.repa_dir)) if v}
@@ -95,24 +108,61 @@ def main():
     print(f"[teacher] {len(sig)-1} steps, sigma {float(sig[0]):.2f} -> "
           f"{float(sig[-2]):.4f} -> 0")
 
-    gen = torch.Generator(device=dev).manual_seed(a.seed)
-    # No autocast: this is the reference, and at sigma_max a VP teacher needs
-    # the precision for exactly the reason RUNPLAN section 6 gives.
-    x = heun(G, a.n, list(shape), sig, dev, gen, int(meta.get("n_classes", 1) or 1))
-
-    if meta.get("space") == "pixel" or shape[0] == 3:
-        imgs = decode(x, None, 1.0).cpu()
-    else:
+    pixel = meta.get("space") == "pixel" or shape[0] == 3
+    vae, scale = None, 1.0
+    if not pixel:
         from diffusers import AutoencoderKL
         from ddgpu.prepare import LATENT_SCALE
         vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(dev).eval()
-        imgs = decode(x, vae, LATENT_SCALE).cpu()
+        scale = LATENT_SCALE
 
-    _save_grid(imgs, a.out)
+    inc = f_real = None
+    if a.fid_n > 0:
+        import numpy as np
+        from ddgpu.prepare import build_inception, inception_feats
+        from ddgpu.eval import fid_from_feats, precision_recall
+        f_real = torch.from_numpy(np.load(a.ref)["feats"]).float()
+        if f_real.ndim != 2 or f_real.shape[1] != 2048:
+            raise SystemExit(f"{a.ref} holds {tuple(f_real.shape)}; expected "
+                             "(N, 2048) from `ddgpu.prepare refstats`")
+        inc = build_inception(dev)
+        print(f"[teacher] scoring {a.fid_n} against {tuple(f_real.shape)}")
+
+    # No autocast: this is the reference, and at sigma_max a VP teacher needs
+    # the precision for exactly the reason RUNPLAN section 6 gives.
+    gen = torch.Generator(device=dev).manual_seed(a.seed)
+    nc = int(meta.get("n_classes", 1) or 1)
+    total, done, grid, feats = max(a.n, a.fid_n), 0, [], []
+    while done < total:
+        b = min(a.batch, total - done)
+        x = heun(G, b, list(shape), sig, dev, gen, nc, verbose=(done == 0))
+        imgs = decode(x, vae, scale).cpu()
+        if sum(len(g) for g in grid) < a.n:
+            grid.append(imgs)
+        if inc is not None and done < a.fid_n:
+            feats.append(inception_feats(inc, imgs[:a.fid_n - done], dev, a.batch))
+        done += b
+        print(f"[teacher] {done}/{total} images", flush=True)
+
+    _save_grid(torch.cat(grid)[:a.n], a.out)
     print(f"[teacher] grid -> {a.out}")
-    print("  Clean images here mean the data path and the teacher wrapper are "
-          "fine\n  and the problem is downstream, in the distillation. Compare "
-          "with:\n    python3 scripts/sample_stats.py " + a.out)
+
+    if inc is not None:
+        f_fake = torch.cat(feats)[:a.fid_n]
+        k = min(10000, len(f_real), len(f_fake))
+        prec, rec = precision_recall(f_real[:k], f_fake[:k])
+        print(json.dumps(dict(teacher=a.teacher, steps=a.steps, n=len(f_fake),
+                              fid=float(fid_from_feats(f_real, f_fake)),
+                              precision=float(prec), recall=float(rec)), indent=1))
+        print(f"  This is the CEILING at {a.steps} steps. Read the student's "
+              "numbers against it,\n  not against zero -- and if recall here is "
+              "also ~0, the metric is the problem.")
+        if len(f_fake) < 50000:
+            print(f"  NOTE: FID over {len(f_fake)} samples is biased upward and "
+                  "is not comparable\n  to published 50k figures; the student "
+                  "must be scored at the same n.")
+
+    print("  Compare the grid with:\n    python3 scripts/sample_stats.py " + a.out)
 
 
 if __name__ == "__main__":
