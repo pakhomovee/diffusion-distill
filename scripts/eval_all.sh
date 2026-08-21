@@ -31,6 +31,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/common.sh"
 
+# CKPT="final" is the DEFAULT, not a recommendation. LOG ENTRY 014 measured a
+# CIFAR run collapsing monotonically from step 5000 onward -- recall 0.104 ->
+# 0.003, FID 122 -> 175 -- so ckpt_final.pt was the WORST checkpoint in it and
+# scoring it silently reported the bottom of the curve. Scan the trajectory
+# (--ckpt 5000, 10000, ...) before believing any single number.
 DATASET=""; GPUS=""; N=50000; CKPT="final"; WEIGHTS="ema"; TOL=0.15
 ONLY=""; EXCLUDE='^smoke'; SKIP_SETUP=0; DRY_RUN=0; SHUTDOWN=0
 

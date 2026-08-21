@@ -1096,3 +1096,52 @@ STILL NOT RUN ON A GPU. Everything above is verified on CPU against analytic
 targets and tiny fixtures. The first real test is `scripts/smoke.sh --gpu`
 followed by `python3 -m ddgpu.teachers --teacher diffusers:google/ddpm-cifar10-32
 --data data/cifar10`, which is where validate_teacher meets a real checkpoint.
+
+--------------------------------------------------------------------------------
+ENTRY 014 -- PHASE C COLLAPSES PROGRESSIVELY, AND 20000 STEPS IS PAST THE PEAK
+
+First trajectory scan of a CIFAR run (cifar10_dmd2, sigma_max=40, seed 0), every
+checkpoint scored at n=5000 against the same 50k reference:
+
+    step     FID   precision   recall   GPU-h
+    5000   121.6       0.614   0.1044     1.6
+   10000   136.0       0.628   0.0834     3.3
+   15000   165.2       0.644   0.0414     4.9
+   20000   175.1       0.682   0.0028     6.5
+
+Monotone in all three. Recall falls 37x, precision rises, FID rises 44%. That
+combination -- coverage traded for per-sample fidelity, steadily -- is mode
+collapse in progress, not undertraining. Three consequences:
+
+  * The BEST model in this run is the EARLIEST checkpoint. `ckpt_final.pt` is
+    the worst one, and it is what `eval_all.sh` scores by default. Every number
+    the programme would have reported was taken at the bottom of the curve.
+  * "Train longer" is falsified for this configuration. The 20000-step budget in
+    the cheap tier is not merely wasteful, it is actively harmful -- 4.9 of the
+    6.5 GPU-h made the model worse.
+  * The peak is at or before 5000 steps, which is unresolved. A scan at 1000-step
+    granularity is 1.6 GPU-h of already-paid compute away.
+
+Two candidate mechanisms, and they point opposite ways:
+
+  (A) the fake-score critic lags. `dmd2.step` is commented "critic updates
+      (two-timescale)" but ships `d_steps=1`, which is ONE critic update per
+      generator update -- the same timescale, not two. DMD's gradient is only
+      the KL gradient when s_fake tracks the generator; a stale s_fake biases
+      it. Fix direction: raise d_steps and/or lr_d.
+  (B) the GAN term is too strong. Note that gan_weight=1e-3 is NOT small: the
+      DM and critic losses average over B*C*H*W = 1572864 elements while
+      d_loss/g_loss average over B = 512, so a unit of GAN loss carries 3072x
+      more gradient. 1e-3 * 3072 ~ 3 in gradient-equivalent terms. Rising
+      precision with falling recall is also the classic GAN collapse signature.
+      Fix direction: lower gan_weight.
+
+These are cheaply separable, and the separating run is one the programme needs
+anyway: the `robust` arm sets gan_weight=0 and has no discriminator at all. If
+it collapses the same way, (B) is out and the fault is in the DM dynamics; if
+it does not, the GAN is implicated. Either answer is worth 6.5 GPU-h.
+
+Not yet ruled out: that precision/recall itself misbehaves here. Nothing in the
+repo had ever scored a model known to be good, so `scripts/teacher_sample.py
+--fid-n` now exists to score the teacher through the identical reference,
+Inception and code path. Run it before trusting any recall number above.
