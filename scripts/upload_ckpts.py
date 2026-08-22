@@ -26,12 +26,20 @@ import os
 # BEFORE huggingface_hub is imported anywhere. See the docstring.
 _MIRROR_CLEARED = os.environ.pop("HF_ENDPOINT", None)
 
+import gc                                                # noqa: E402
 import glob                                              # noqa: E402
 import json                                              # noqa: E402
 import re                                                # noqa: E402
+import resource                                          # noqa: E402
 import tempfile                                          # noqa: E402
 
 import torch                                             # noqa: E402
+
+
+def _rss():
+    """Peak resident memory so far -- this script has been OOM-killed before."""
+    kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return f"  [peak RSS {kb / 1e6:.2f} GB]"
 
 
 def ckpt_sort_key(path):
@@ -64,6 +72,11 @@ def main():
                    help="path inside the repo (default: the run directory's name)")
     p.add_argument("--keep-all", action="store_true",
                    help="upload student+critic too, so the run can be resumed")
+    p.add_argument("--force", action="store_true",
+                   help="re-upload files already present in the repo")
+    p.add_argument("--no-xet", action="store_true",
+                   help="disable the Xet upload backend; it chunks in memory and "
+                        "is the other half of the OOM on a small container")
     p.add_argument("--dry-run", action="store_true")
     a = p.parse_args()
 
@@ -84,22 +97,50 @@ def main():
     print(f"[upload] {len(cks)} checkpoints + {len(extras)} small files "
           f"-> {a.repo}:{prefix}/")
 
-    api = None
+    if a.no_xet:
+        # Must precede the huggingface_hub import: it reads this into a module
+        # constant, exactly like HF_ENDPOINT.
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+
+    api, already = None, set()
     if not a.dry_run:
         from huggingface_hub import HfApi
         api = HfApi(token=a.token)
         api.create_repo(a.repo, repo_type=a.repo_type, exist_ok=True)
+        # Resume: an interrupted run has already pushed some of these, and each
+        # is ~143 MB.
+        already = {f for f in api.list_repo_files(a.repo, repo_type=a.repo_type)
+                   if f.startswith(prefix + "/")}
+        if already:
+            print(f"[upload] {len(already)} file(s) already in {a.repo}:{prefix}/")
 
     with tempfile.TemporaryDirectory() as td:
         for c in cks:
             name = os.path.basename(c)
-            blob = torch.load(c, map_location="cpu", weights_only=False)
+            if f"{prefix}/{name}" in already and not a.force:
+                print(f"  {name:20} already in the repo, skipping (--force to redo)")
+                continue
+
+            # mmap so the 429 MB never lands in RSS: only the tensors `slim`
+            # keeps are faulted in, when torch.save reads them.
+            try:
+                blob = torch.load(c, map_location="cpu", weights_only=False,
+                                  mmap=True)
+            except (TypeError, RuntimeError):        # torch < 2.1, or legacy format
+                blob = torch.load(c, map_location="cpu", weights_only=False)
             small = slim(blob, a.keep_all)
             local = os.path.join(td, name)
             torch.save(small, local)
             before, after = os.path.getsize(c), os.path.getsize(local)
+            step, keys = blob.get("it"), sorted(small)
+            # Drop BOTH before uploading. Holding a 429 MB blob and a 143 MB copy
+            # while the Xet client chunks the file is what got this OOM-killed on
+            # a container the first time; the upload reads from disk and needs
+            # neither.
+            del small, blob
+            gc.collect()
             print(f"  {name:20} {before/1e6:7.1f} MB -> {after/1e6:7.1f} MB "
-                  f"(step {blob.get('it')}, keys {sorted(small)})")
+                  f"(step {step}, keys {keys}){_rss()}")
             if api:
                 api.upload_file(path_or_fileobj=local,
                                 path_in_repo=f"{prefix}/{name}",
@@ -107,6 +148,9 @@ def main():
             os.remove(local)
 
         for f in extras:
+            if f"{prefix}/{f}" in already and not a.force:
+                print(f"  {f} already in the repo, skipping")
+                continue
             print(f"  {f}")
             if api:
                 api.upload_file(path_or_fileobj=f"{run}/{f}",
