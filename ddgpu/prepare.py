@@ -215,7 +215,15 @@ class HFParquetImages(torch.utils.data.Dataset):
         from huggingface_hub import hf_hub_download
         path = hf_hub_download(spec["repo"], spec["train" if train else "test"],
                                repo_type="dataset")
-        t = pq.read_table(path, columns=["img", "label"])
+        # ParquetFile.read, NOT pq.read_table. read_table routes through
+        # pyarrow.dataset, whose module init touches pyarrow's OPTIONAL pandas
+        # shim -- so on a box where pandas and numpy disagree about ABI
+        # ("numpy.dtype size changed ... Expected 96 ... got 88") importing it
+        # raises and takes this loader down with it. Nothing here needs pandas,
+        # it is not in requirements.txt, and the low-level reader does not pull
+        # it in: verified that ParquetFile.read leaves both pyarrow.dataset and
+        # pandas absent from sys.modules while read_table imports the former.
+        t = pq.ParquetFile(path).read(columns=["img", "label"])
         # Keep the PNGs encoded and decode in __getitem__: a Subset of 2 000
         # should not pay to decode 50 000, and the encoded column is no larger
         # than the decoded pixels would be.
