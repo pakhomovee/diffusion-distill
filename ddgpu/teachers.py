@@ -251,6 +251,20 @@ def _load_diffusers(repo, device, sigma_data=0.5, **kw):
             "    python3 -c 'import torch, huggingface_hub, diffusers; print("
             "torch.__version__, huggingface_hub.__version__, diffusers.__version__)'"
         ) from e
+    # diffusers/models/model_loading_utils.py does a bare `import safetensors`
+    # at module level and then calls `safetensors.torch.load_file(...)`. That
+    # only resolves if SOMETHING in the process has imported the submodule,
+    # because importing a submodule is what binds it as an attribute of its
+    # package -- and safetensors 0.8 does not import .torch from __init__. The
+    # result is `module 'safetensors' has no attribute 'torch'`, which diffusers
+    # then reports as "Unable to load weights from checkpoint file", i.e. as a
+    # corrupt download. Importing it here costs nothing and fixes the real
+    # thing, rather than falling through to the .bin below.
+    try:
+        import safetensors.torch                                   # noqa: F401
+    except Exception:                                              # noqa: BLE001
+        pass                       # genuinely absent: the fallback handles it
+
     try:
         unet = UNet2DModel.from_pretrained(repo).to(device).eval()
     except (OSError, AttributeError, ImportError) as e:
