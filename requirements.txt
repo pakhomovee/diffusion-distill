@@ -10,11 +10,15 @@
 numpy>=1.24
 scipy>=1.10           # linalg.sqrtm, for the Frechet distance
 pillow>=9.0
-diffusers>=0.27       # AutoencoderKL (SD-VAE) and UNet2DModel only, both
-                      # long-stable. Deliberately no upper bound, but note a
-                      # diffusers newer than your torch fails AT IMPORT --
-                      # "module 'torch' has no attribute 'xpu'" means torch
-                      # < 2.4 with a diffusers that assumes >= 2.4.
+diffusers>=0.29.2     # AutoencoderKL (SD-VAE) and UNet2DModel only, both
+                      # long-stable -- but the usable range is squeezed at BOTH
+                      # ends and neither end is expressed in package metadata:
+                      #   <= 0.28.2 imports huggingface_hub.cached_download,
+                      #             removed in hub 0.26  -> ImportError
+                      #   newer     touches torch.xpu at import, which needs
+                      #             torch >= 2.4         -> AttributeError
+                      # Verified against the wheels: 0.29.2-0.32.2 have neither.
+                      # 0.31.0 if you need one number.
 safetensors>=0.4
 huggingface_hub>=0.20
 pytorch-fid>=0.3.0    # the canonical FID InceptionV3; ddgpu.prepare + ddgpu.generate

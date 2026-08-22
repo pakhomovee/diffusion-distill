@@ -219,7 +219,7 @@ def _load_dit(path, device, n_classes=1000, in_ch=4, sigma_data=1.0, **kw):
 def _load_diffusers(repo, device, sigma_data=0.5, **kw):
     try:
         from diffusers import UNet2DModel
-    except AttributeError as e:
+    except (AttributeError, ImportError) as e:
         # A diffusers newer than the installed torch. The usual shape is
         # `module 'torch' has no attribute 'xpu'` from diffusers/utils/
         # torch_utils.py, because torch.xpu only exists from torch 2.4 -- and it
@@ -227,13 +227,23 @@ def _load_diffusers(repo, device, sigma_data=0.5, **kw):
         # a version skew. Nothing here uses any recent diffusers feature:
         # UNet2DModel and AutoencoderKL are both long-stable.
         raise SystemExit(
-            f"diffusers will not import against this torch: {e}\n"
-            "  This is a version skew, not a problem with the teacher. Check:\n"
-            "    python3 -c 'import torch, diffusers; "
-            "print(torch.__version__, diffusers.__version__)'\n"
-            "  and install a diffusers contemporaneous with that torch, e.g.\n"
-            "    pip install 'diffusers==0.27.2'   "
-            "(requirements.txt asks only for >=0.27)") from e
+            f"diffusers will not import here: {e}\n"
+            "  A version skew, not a problem with the teacher. It is squeezed\n"
+            "  from both sides:\n"
+            "    too NEW -> \"module 'torch' has no attribute 'xpu'\"; torch.xpu\n"
+            "               needs torch >= 2.4 and diffusers touches it on import\n"
+            "    too OLD -> \"cannot import name 'cached_download'\"; huggingface_hub\n"
+            "               dropped it in 0.26, diffusers <= 0.28 still imports it\n"
+            "  Checked against the published wheels: 0.29.2-0.32.2 contain neither\n"
+            "  reference. 0.31.0 mentions torch.xpu and cached_download zero times\n"
+            "  anywhere in the package and imports only hf_hub_download/model_info\n"
+            "  from the hub, so:\n"
+            "    pip install 'diffusers==0.31.0'\n"
+            "  Nothing here needs a recent diffusers -- UNet2DModel and\n"
+            "  AutoencoderKL are both long-stable. Versions:\n"
+            "    python3 -c 'import torch, huggingface_hub, diffusers; print("
+            "torch.__version__, huggingface_hub.__version__, diffusers.__version__)'"
+        ) from e
     unet = UNet2DModel.from_pretrained(repo).to(device).eval()
     # Read the schedule from the repo rather than assuming DDPM defaults: a
     # scaled-linear or cosine schedule with the same file layout would give a
