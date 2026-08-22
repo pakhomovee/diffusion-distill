@@ -45,6 +45,9 @@ BASE = dict(
     # lr_gan=None means "use lr_d", which is what DMD2 does -- it relies on
     # d_steps to let the discriminator keep up, not on a higher rate.
     lr_gan=None, gan_d_weight=4.0e-2,
+    # gan_pull_critic allocates two full critic gradient sets; off by default
+    # so a VRAM-tight run is not tipped over on its logged steps.
+    gan_critic_diag=False,
     # d_steps=5 is DMD2's dfake_gen_update_ratio from the published ImageNet-64
     # GAN run -- five critic updates per generator update. The old default of 1
     # is no two-timescale rule at all, despite the comment in DMD2Trainer.step.

@@ -217,7 +217,15 @@ class DMD2Trainer:
                 # learns, which makes the term self-defeating. That is what 1e-3
                 # was doing -- attenuating the head's own gradient 1000x.
                 wd = float(c.get("gan_d_weight", 1.0))
-                if self._diag_step() and not _is_ddp(self.mu):
+                # Opt-in: this one is the memory-hungry diagnostic. It takes
+                # autograd.grad over ALL critic parameters twice with
+                # retain_graph, so it allocates two full gradient sets (~286 MB
+                # for a 35.7M critic) and holds the graph across both -- on a
+                # card already at 31.7 of 31.8 GiB that is enough to tip a
+                # logged step over. gan_pull (generator side) stays on: it is a
+                # grad w.r.t. one tensor and costs almost nothing.
+                if (c.get("gan_critic_diag", False) and self._diag_step()
+                        and not _is_ddp(self.mu)):
                     ps = [p for p in _raw(self.mu).parameters() if p.requires_grad]
                     nrm = lambda gs: torch.sqrt(sum(
                         (g * g).sum() for g in gs if g is not None)).item()
