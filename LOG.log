@@ -1175,3 +1175,57 @@ Not yet ruled out: that precision/recall itself misbehaves here. Nothing in the
 repo had ever scored a model known to be good, so `scripts/teacher_sample.py
 --fid-n` now exists to score the teacher through the identical reference,
 Inception and code path. Run it before trusting any recall number above.
+
+--------------------------------------------------------------------------------
+ENTRY 015 -- REMOVING THE DISCRIMINATOR REMOVES THE COLLAPSE
+
+ENTRY 014 left two hypotheses. (A) the critic lags, because d_steps=1 is not the
+two-timescale rule the code claims. (B) the substituted ConvGANHead is the
+problem. The separating run holds everything fixed and sets gan_weight=0:
+
+  cifar10_dmd2_s40_nogan, sigma_max=40, 8000 steps, scored at n=5000
+
+    step     FID   precision   recall
+    1000   250.5       0.387   0.0000
+    2000   177.5       0.500   0.0134
+    3000   131.9       0.563   0.0854
+    4000   119.5       0.608   0.0922      <- best FID
+    5000   127.4       0.639   0.0890
+    6000   129.5       0.631   0.1186
+    7000   127.3       0.642   0.1208      <- peak recall
+    8000   127.5       0.656   0.1098
+
+against the with-GAN arm, same sigma_max, same n:
+
+    5000   121.6       0.614   0.1044
+   10000   136.0       0.628   0.0834
+   15000   165.2       0.644   0.0414
+   20000   175.1       0.682   0.0028
+
+(B) IS CONFIRMED. Without the discriminator, recall climbs to ~0.12 and holds,
+and FID plateaus near 127. With it, recall peaks at 5000 and decays 37x. The
+divergence is inside the observed window, not an artefact of unequal lengths:
+the GAN arm is already descending at 10000 while the no-GAN arm is still
+climbing at 6000-7000.
+
+What this costs the programme. The cheap tier's baseline is not DMD2 -- it is
+DMD2 with a discriminator DMD2 does not use, and that substitute is what
+destroys it. "Track A beats DMD2" cannot be claimed from this configuration.
+Worse, the default arms differ by TWO things at once: mkconfig's dmd2 sets
+gan_weight=1e-3 and robust leaves it at 0, so the delta is (score fusion) AND
+(discriminator removed). Since the discriminator is now known to be the
+dominant effect, a robust-vs-dmd2 comparison would mostly measure the thing
+that is broken.
+
+The control this creates is the useful part. `dmd2 --set gan_weight=0` and
+`robust` differ by EXACTLY the score-fusion switch, which is the property
+scripts/mkconfig.py's header claims for the arms and the default pair does not
+have. That pair is the comparison Track A actually needs.
+
+Caveats, both cheap to close:
+  * 8000 steps, not 20000. The trend is flat-to-rising, but "no collapse ever"
+    needs the matched length.
+  * still no teacher ceiling. FID ~120 with recall 0.12 is much healthier than
+    FID 175 with recall 0.003, and still nowhere near good -- but nothing has
+    yet established what this metric returns for a model known to work.
+    scripts/teacher_sample.py --fid-n is written and unrun.
