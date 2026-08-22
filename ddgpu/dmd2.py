@@ -205,6 +205,22 @@ class DMD2Trainer:
             sg = self.sample_sigma(n, self.dev)
             xg_n = xg + sg.reshape(-1, 1, 1, 1) * torch.randn_like(xg)
             lga = g_loss(self._disc(xg_n, sg, yg))
+            # How hard is the GAN term ACTUALLY pulling? Not answerable from the
+            # loss values: the DM loss averages over B*C*H*W and the GAN loss
+            # over B, so a unit of GAN loss carries C*H*W = 3072x more gradient
+            # on CIFAR. That factor is exact, but the ratio also depends on
+            # |d logit / d x|, which is a property of the discriminator and has
+            # to be measured. Taken w.r.t. the SAMPLES rather than the
+            # parameters: it is the same ratio, needs no second parameter
+            # backward, and cannot upset DDP's reducer.
+            if self.step_i % c.get("diag_every", 500) == 0:
+                gd = torch.autograd.grad(lg, xg, retain_graph=True)[0].norm()
+                gg = torch.autograd.grad(c["gan_weight"] * lga, xg,
+                                         retain_graph=True)[0].norm()
+                info["gnorm_dm"] = gd.item()
+                info["gnorm_gan"] = gg.item()
+                # >1 means the adversary outweighs distribution matching.
+                info["gan_pull"] = (gg / gd.clamp_min(1e-12)).item()
             lg = lg + c["gan_weight"] * lga
             info["loss_gan_g"] = lga.item()
         self.opt_G.zero_grad(set_to_none=True)
