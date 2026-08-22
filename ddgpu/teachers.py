@@ -217,7 +217,23 @@ def _load_dit(path, device, n_classes=1000, in_ch=4, sigma_data=1.0, **kw):
 
 
 def _load_diffusers(repo, device, sigma_data=0.5, **kw):
-    from diffusers import UNet2DModel
+    try:
+        from diffusers import UNet2DModel
+    except AttributeError as e:
+        # A diffusers newer than the installed torch. The usual shape is
+        # `module 'torch' has no attribute 'xpu'` from diffusers/utils/
+        # torch_utils.py, because torch.xpu only exists from torch 2.4 -- and it
+        # fires at IMPORT time, so it looks like a broken checkpoint rather than
+        # a version skew. Nothing here uses any recent diffusers feature:
+        # UNet2DModel and AutoencoderKL are both long-stable.
+        raise SystemExit(
+            f"diffusers will not import against this torch: {e}\n"
+            "  This is a version skew, not a problem with the teacher. Check:\n"
+            "    python3 -c 'import torch, diffusers; "
+            "print(torch.__version__, diffusers.__version__)'\n"
+            "  and install a diffusers contemporaneous with that torch, e.g.\n"
+            "    pip install 'diffusers==0.27.2'   "
+            "(requirements.txt asks only for >=0.27)") from e
     unet = UNet2DModel.from_pretrained(repo).to(device).eval()
     # Read the schedule from the repo rather than assuming DDPM defaults: a
     # scaled-linear or cosine schedule with the same file layout would give a
