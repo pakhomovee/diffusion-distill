@@ -32,6 +32,11 @@ BASE = dict(
     P_mean=-1.2, P_std=1.2,          # only used when sigma_dist == "lognormal"
     micro_batch=32, steps=50000,
     lr_g=1e-5, lr_d=1e-5, clip=1.0,
+    # The GAN head is random where the critic is teacher-initialised, so it
+    # gets its own learning rate; None falls back to lr_d. And gan_d_weight
+    # scales the discriminator's OWN objective, which gan_weight used to do
+    # as a side effect -- see DMD2Trainer.step.
+    lr_gan=1e-4, gan_d_weight=1.0,
     n_student_steps=1, cfg_scale=1.75, d_steps=1,
     ema_decay=0.999,
     log_every=50, diag_every=500, probe_every=2500, ckpt_every=5000,

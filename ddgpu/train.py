@@ -276,6 +276,8 @@ def main():
                       f"kind={tr.gan_kind} "
                       f"({'head on the critic features -- DMD2' if tr.gan_kind == 'trunk' else 'STANDALONE conv net on pixels -- NOT DMD2, see LOG ENTRY 015'}) "
                       f"weight={c.get('gan_weight', 0.0)} "
+                      f"d_weight={c.get('gan_d_weight', 1.0)} "
+                      f"lr_gan={tr.lr_gan:g} lr_d={c['lr_d']:g} "
                       f"params={sum(p.numel() for p in tr.gan.parameters()) / 1e6:.2f}M"))
     else:
         enc = build_model(c, dev, schedule, precond=False)   # raw DiT, see invertible.py

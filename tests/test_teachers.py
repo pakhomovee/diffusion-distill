@@ -359,13 +359,96 @@ def t_unet_trunk():
 
 
 # --------------------------------------------------------------------------
+def t_gan_param_groups():
+    """The GAN head must get its own learning rate, and its own loss weight.
+
+    Two separate defects, neither visible in a loss curve:
+
+    * ONE learning rate for the critic and the head. The critic is 35.7M
+      teacher-initialised parameters that need fine-tuning; the head is 0.33M
+      RANDOM parameters that need to learn. At a shared 1e-5 the head stays at
+      its initialisation -- measured on an A100, hinge d_loss is 1.0 at zero
+      logits and after 300 steps had reached only 0.938.
+    * `gan_weight` scaled the discriminator's OWN objective as well as its
+      influence on the generator. Those are unrelated jobs, and a weight small
+      enough to be safe for the generator attenuates the head's own gradient by
+      the same factor -- 1000x at 1e-3 -- so the term cannot work at any setting
+      that is also safe. gan_d_weight separates them.
+    """
+    try:
+        from diffusers import UNet2DModel
+    except ImportError:
+        print("  SKIP  diffusers not installed")
+        return
+    from ddgpu.teachers import DiffusersUNetAdapter
+    from ddgpu.vp import VPSchedule, VPPrecond
+    from ddgpu.dmd2 import DMD2Trainer
+
+    torch.manual_seed(0)
+
+    def mk():
+        u = UNet2DModel(sample_size=8, in_channels=3, out_channels=3,
+                        layers_per_block=1, block_out_channels=(8, 16),
+                        norm_num_groups=4, attention_head_dim=8,
+                        down_block_types=("DownBlock2D", "AttnDownBlock2D"),
+                        up_block_types=("AttnUpBlock2D", "UpBlock2D"))
+        sch = VPSchedule(1000)
+        return VPPrecond(DiffusersUNetAdapter(u), sch, out_ch=3, sigma_data=0.5), sch
+
+    base = dict(sigma_data=0.5, shape=[3, 8, 8], n_classes=1, sigma_max=40.0,
+                n_student_steps=1, sigma_dist="vp_uniform_t", t_min=20, t_max=979,
+                lr_g=1e-5, lr_d=1e-5, clip=1.0, d_steps=1, mode="teacher",
+                cfg_scale=1.0, track="A", ema_decay=0.999, gather_real=False,
+                log_every=1)
+
+    def trainer(**kw):
+        G, sch = mk(); mu, _ = mk(); T, _ = mk()
+        for q in T.parameters():
+            q.requires_grad_(False)
+        return DMD2Trainer(G, mu, T, dict(base, **kw), device="cpu", schedule=sch), mu
+
+    tr, mu = trainer(gan_weight=1e-3, lr_gan=1e-4)
+    gs = tr.opt_D.param_groups
+    check("opt_D has a group per job", len(gs) == 2, f"{len(gs)} groups")
+    head = {id(q) for q in tr.gan.parameters()}
+    crit = {id(q) for q in mu.parameters()}
+    by_lr = {g["lr"]: {id(q) for q in g["params"]} for g in gs}
+    check("head group is at lr_gan", by_lr.get(1e-4) == head,
+          f"lrs {sorted(by_lr)}")
+    check("critic group is at lr_d", by_lr.get(1e-5) == crit)
+    check("the two groups are disjoint", not (head & crit))
+    check("every head parameter is optimised",
+          head <= set().union(*by_lr.values()))
+
+    tr2, _ = trainer(gan_weight=1e-3)                    # lr_gan omitted
+    check("lr_gan defaults to lr_d", tr2.lr_gan == base["lr_d"], str(tr2.lr_gan))
+
+    tr3, _ = trainer(gan_weight=0.0)
+    check("no discriminator -> a single group",
+          len(tr3.opt_D.param_groups) == 1 and tr3.gan is None)
+
+    # gan_d_weight must drive the critic-side loss, independently of gan_weight.
+    x = torch.randn(4, 3, 8, 8) * 0.5
+    y = torch.zeros(4, dtype=torch.long)
+    lo, _ = trainer(gan_weight=1e-3, gan_d_weight=0.0)
+    hi, _ = trainer(gan_weight=1e-3, gan_d_weight=1.0)
+    a = lo.step(x, y)["gan_pull_critic"]
+    b = hi.step(x, y)["gan_pull_critic"]
+    check("gan_d_weight=0 removes the GAN from the critic update", a == 0.0,
+          f"{a:.3e}")
+    check("gan_d_weight=1 restores it", b > 0.0, f"{b:.3e}")
+    check("and it is NOT gan_weight that controls this",
+          b > 100 * max(a, 1e-30), f"{a:.3e} vs {b:.3e}")
+
+
+# --------------------------------------------------------------------------
 if __name__ == "__main__":
     for fn in (t_interpolant_map, t_interpolant_exact_on_gaussian,
                t_student_grid_signature, t_gaussian_teacher,
                t_validate_teacher_catches_miswrapping, t_teacher_spec_errors,
                t_dsm_identity, t_offline_matches_online,
                t_pixel_dataset, t_gaussian_data, t_conv_gan_head,
-               t_unet_trunk):
+               t_unet_trunk, t_gan_param_groups):
         print(f"\n== {fn.__name__} ==")
         fn()
     print("\n" + ("ALL PASS" if not FAIL else f"{len(FAIL)} FAILED: {FAIL}"))

@@ -74,9 +74,18 @@ class DMD2Trainer:
             else:
                 self.gan = ConvGANHead(cfg["shape"][0], res=cfg["shape"][-1]).to(device)
                 self.gan_kind = "conv"
-        params_D = list(self.mu.parameters()) + (
-            list(self.gan.parameters()) if self.gan else [])
-        self.opt_D = torch.optim.AdamW(params_D, lr=cfg["lr_d"],
+        # Two param groups, because these are two different jobs. The critic is
+        # a 35.7M teacher-initialised network that needs fine-tuning; the GAN
+        # head is a 0.33M RANDOM network that needs to learn. One learning rate
+        # for both leaves the head at its initialisation -- measured: hinge
+        # d_loss is 1.0 at zero logits and after 300 steps it had reached only
+        # 0.938, so the discriminator was still essentially uninformative and
+        # gan_pull came back at 0.008.
+        self.lr_gan = float(cfg.get("lr_gan") or cfg["lr_d"])
+        groups = [dict(params=list(self.mu.parameters()), lr=cfg["lr_d"])]
+        if self.gan is not None:
+            groups.append(dict(params=list(self.gan.parameters()), lr=self.lr_gan))
+        self.opt_D = torch.optim.AdamW(groups, lr=cfg["lr_d"],
                                        betas=(0.0, 0.999), weight_decay=0.01)
         # Diagnostic only -- never touches the training lambda. See FINDINGS 3.1.
         self.probe = LambdaProbe(n_bins=cfg.get("probe_bins", 16),
@@ -193,17 +202,25 @@ class DMD2Trainer:
                 # supplies s_fake to dm_loss, corrupting it corrupts the
                 # distribution-matching gradient indirectly -- which gan_pull,
                 # measured at the generator, cannot see.
+                # gan_d_weight, NOT gan_weight. `lgan` is the discriminator's OWN
+                # objective, not a regulariser on it, and scaling it by the same
+                # constant that governs its influence on the GENERATOR conflates
+                # two unrelated jobs: a weight small enough to be safe for the
+                # generator is also small enough that the discriminator never
+                # learns, which makes the term self-defeating. That is what 1e-3
+                # was doing -- attenuating the head's own gradient 1000x.
+                wd = float(c.get("gan_d_weight", 1.0))
                 if self._diag_step() and not _is_ddp(self.mu):
                     ps = [p for p in _raw(self.mu).parameters() if p.requires_grad]
                     nrm = lambda gs: torch.sqrt(sum(
                         (g * g).sum() for g in gs if g is not None)).item()
                     a = nrm(torch.autograd.grad(ld_dsm, ps, retain_graph=True,
                                                 allow_unused=True))
-                    b = nrm(torch.autograd.grad(c["gan_weight"] * lgan, ps,
+                    b = nrm(torch.autograd.grad(wd * lgan, ps,
                                                 retain_graph=True, allow_unused=True))
                     logs["cnorm_dsm"], logs["cnorm_gan"] = a, b
                     logs["gan_pull_critic"] = b / max(a, 1e-12)
-                ld = ld + c["gan_weight"] * lgan
+                ld = ld + wd * lgan
                 logs["loss_gan_d"] = lgan.item()
             self.opt_D.zero_grad(set_to_none=True)
             ld.backward()
