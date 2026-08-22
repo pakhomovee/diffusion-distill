@@ -251,7 +251,27 @@ def _load_diffusers(repo, device, sigma_data=0.5, **kw):
             "    python3 -c 'import torch, huggingface_hub, diffusers; print("
             "torch.__version__, huggingface_hub.__version__, diffusers.__version__)'"
         ) from e
-    unet = UNet2DModel.from_pretrained(repo).to(device).eval()
+    try:
+        unet = UNet2DModel.from_pretrained(repo).to(device).eval()
+    except (OSError, AttributeError, ImportError) as e:
+        # The safetensors backend is optional, and when it is broken diffusers
+        # reports it as "Unable to load weights from checkpoint file" -- which
+        # reads as a corrupt download rather than a broken dependency. The
+        # giveaway upstream is `module 'safetensors' has no attribute 'torch'`,
+        # then a UnicodeDecodeError from diffusers sniffing the file for an LFS
+        # pointer. The file is fine.
+        #
+        # Every released DDPM repo ships diffusion_pytorch_model.bin alongside
+        # the .safetensors, and they hold the same tensors, so falling back
+        # costs nothing. Verified for google/ddpm-cifar10-32.
+        print(f"[teachers] safetensors load failed ({type(e).__name__}: "
+              f"{str(e).splitlines()[0][:80]});\n"
+              "           retrying with use_safetensors=False (the .bin holds "
+              "the same weights).\n"
+              "           Durable fix: pip install -U --force-reinstall "
+              "safetensors", flush=True)
+        unet = UNet2DModel.from_pretrained(
+            repo, use_safetensors=False).to(device).eval()
     # Read the schedule from the repo rather than assuming DDPM defaults: a
     # scaled-linear or cosine schedule with the same file layout would give a
     # completely different sigma(t) and no error.
