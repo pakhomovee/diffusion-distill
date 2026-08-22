@@ -267,6 +267,16 @@ def main():
             critic.net.load_state_dict(teacher.net.state_dict())
         tr = DMD2Trainer(wrap_ddp(student, rank, world), wrap_ddp(critic, rank, world),
                          teacher, c, device=dev, schedule=schedule)
+        # WHICH discriminator got built is the difference between reproducing
+        # DMD2 and reproducing the thing that collapsed in LOG ENTRY 015, and it
+        # is chosen silently by whether the backbone exposes trunk(). Nothing
+        # logged it, so a run could only be told apart after the fact by its
+        # samples. Now it says so at launch.
+        log("GAN " + ("off (gan_weight=0)" if tr.gan is None else
+                      f"kind={tr.gan_kind} "
+                      f"({'head on the critic features -- DMD2' if tr.gan_kind == 'trunk' else 'STANDALONE conv net on pixels -- NOT DMD2, see LOG ENTRY 015'}) "
+                      f"weight={c.get('gan_weight', 0.0)} "
+                      f"params={sum(p.numel() for p in tr.gan.parameters()) / 1e6:.2f}M"))
     else:
         enc = build_model(c, dev, schedule, precond=False)   # raw DiT, see invertible.py
         anchors = None
