@@ -54,6 +54,29 @@ def wrap_precond(net, c, schedule):
     return EDMWrapper(net, c["sigma_data"])
 
 
+def enable_grad_ckpt(module):
+    """Turn on activation checkpointing wherever this backbone supports it.
+
+    `build_model`'s grad_ckpt only reaches our own DiT, so every registry
+    teacher -- diffusers UNet, EDM pickle, SiT -- was cloned without it and had
+    no way to trade compute for VRAM. That matters most with DMD2's trunk
+    discriminator, which retains the critic's encoder activations for two extra
+    passes in the critic update and one more in the generator update.
+
+    diffusers' ModelMixin exposes `enable_gradient_checkpointing()`; our DiT has
+    a `grad_ckpt` flag. Returns the class it enabled, or None.
+    """
+    for m in module.modules():
+        fn = getattr(m, "enable_gradient_checkpointing", None)
+        if callable(fn):
+            fn()
+            return type(m).__name__
+        if hasattr(m, "grad_ckpt"):
+            m.grad_ckpt = True
+            return type(m).__name__
+    return None
+
+
 def build_model(c, device, schedule, precond=True, grad_ckpt=True):
     net = make_dit(c["arch"], input_size=c["latent_size"], in_ch=c["shape"][0],
                    n_classes=c["n_classes"], grad_ckpt=grad_ckpt,
@@ -265,6 +288,12 @@ def main():
         critic = clone_trainable(teacher) if clone else build_model(c, dev, schedule)
         if not clone and c.get("teacher_ckpt"):
             critic.net.load_state_dict(teacher.net.state_dict())
+        # Opt-in, because it costs ~30% throughput. The teacher stays off: it
+        # runs under no_grad and has no activations to checkpoint.
+        if c.get("grad_ckpt", False):
+            for name, m in (("student", student), ("critic", critic)):
+                got = enable_grad_ckpt(m)
+                log(f"grad_ckpt: {name} -> {got or 'NOT SUPPORTED by this backbone'}")
         tr = DMD2Trainer(wrap_ddp(student, rank, world), wrap_ddp(critic, rank, world),
                          teacher, c, device=dev, schedule=schedule)
         # WHICH discriminator got built is the difference between reproducing

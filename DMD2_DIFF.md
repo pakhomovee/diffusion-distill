@@ -64,7 +64,7 @@ weight between resolutions means holding `w*N` fixed: ImageNet-64 is
 | critic updates per generator update | `dfake_gen_update_ratio 5` | `d_steps 1` | **missing TTUR** |
 | generator adversarial loss | `softplus(-logit)` | `-logit.mean()` | **unbounded** |
 | discriminator loss | `softplus(fake) + softplus(-real)` | hinge | differs |
-| head input | bottleneck, spatial, via convs | bottleneck, **mean-pooled** | **weaker** |
+| head input | bottleneck, spatial, via convs | ~~mean-pooled~~ → same convs | fixed |
 | `gen_cls_loss_weight` | 3e-3, `w*N = 36.9` | 1e-3, `w*N = 3.07` | **12x too weak** |
 | `cls_loss_weight` | 1e-2, `w*N = 122.9` | 1.0, `w*N = 3072` | **25x too strong** |
 | learning rate | 2e-6 (both) | 1e-5 (both) | 5x higher |
@@ -86,7 +86,29 @@ images with red crushed to 23% of correct and the three channels' diversity
 ratios flying apart (0.53 / 0.86 / 1.46).
 
 Together they describe a generator that found a cheap unbounded direction in a
-discriminator that only looks at averages.
+discriminator that only looked at averages. **Both are now fixed.** `GANHead` is
+DMD2's conv stack, verified to reproduce `cls_pred_branch` exactly at its
+ImageNet-64 geometry:
+
+    GANHead(768, 8) ->  Conv2d(768->768, k4 s2 p1)   8x8 -> 4x4
+                        GroupNorm(32), SiLU
+                        Conv2d(768->768, k4 s4 p0)   4x4 -> 1x1
+                        GroupNorm(32), SiLU
+                        Conv2d(768->1,   k1 s1 p0)
+
+generalised over the bottleneck size, because ddpm-cifar10-32's is 4x4x256 --
+the second conv's kernel and stride are both `spatial // 2`, so it always lands
+on 1x1. Unconditioned, as DMD2's is: the noise level is already in the features
+because the critic's own forward was given it. Both backbones report
+`trunk_spatial`, and `_disc` reshapes tokens back to (B, C, H, W).
+
+One trap found while building it. GroupNorm over a 1x1 map with ONE channel per
+group is identically zero, so the head emitted a **constant** -- two identical
+logits, gradient into the critic exactly 0 -- while passing every shape check.
+DMD2 never hits it (768/32 = 24 channels per group), nor does CIFAR
+(256/32 = 8), but a 16-channel test model does. `_groups` now requires at least
+4 per group, and `t_unet_trunk` pins that the head is non-constant in its input
+and that gradient actually reaches the critic through it.
 
 ## Ported settings for CIFAR-10
 
@@ -102,9 +124,6 @@ generator update.
 
 ## Still open
 
-* The head architecture. Matching DMD2 means replacing the mean-pool with
-  strided convs over the bottleneck's spatial extent, which needs `trunk()` to
-  report the spatial shape rather than only tokens. Not done.
 * The learning rate. Ours is 5x theirs, and they train for far longer. Left
   alone for now, since changing it at the same time as everything else would
   make the next run uninterpretable.

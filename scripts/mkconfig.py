@@ -51,7 +51,9 @@ BASE = dict(
     n_student_steps=1, cfg_scale=1.75, d_steps=5,
     ema_decay=0.999,
     log_every=50, diag_every=500, probe_every=2500, ckpt_every=5000,
-    workers=4, amp=True, flip=False,
+    # grad_ckpt trades ~30% throughput for a large cut in activation memory,
+    # and is the lever for fitting the trunk-discriminator run on 32 GB.
+    workers=4, amp=True, flip=False, grad_ckpt=False,
     data=None, teacher_ckpt=None, teacher_format="official",
     # Preferred teacher form: "<family>:<path>" through ddgpu.teachers, which
     # covers DiT / diffusers / EDM / SiT and clones the student from whatever it
