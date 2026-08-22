@@ -213,7 +213,12 @@ def main():
     os.makedirs(a.out_dir, exist_ok=True)
     imgs = sample_images(G, c, sch, dev, max(a.grid, a.fid_n), a.batch,
                          a.seed, use_bf16, vae, scale)
-    grid_path = f"{a.out_dir}/samples.png"
+    # Tag every output with the checkpoint it came from, so scoring a whole
+    # trajectory into one --out-dir does not have each step overwrite the last.
+    # Sharing the directory is the point: the reference is cached there, so
+    # checkpoints 2..N cost nothing to score.
+    tag = os.path.splitext(os.path.basename(a.ckpt))[0].replace("ckpt_", "") or "ckpt"
+    grid_path = f"{a.out_dir}/samples_{tag}.png"
     _save_grid(imgs[:a.grid], grid_path)
     print(f"[colab] grid -> {grid_path}")
 
@@ -230,7 +235,7 @@ def main():
                                     a.seed, True, vae, scale)
             finally:
                 type(G).FP32_MARGIN = margin
-            _save_grid(bad[:a.grid], f"{a.out_dir}/samples_guard_off.png")
+            _save_grid(bad[:a.grid], f"{a.out_dir}/samples_{tag}_guard_off.png")
             d = (imgs[:a.grid].float() - bad[:a.grid].float()).abs().mean() / 255
             print(f"[colab] guard-off grid -> {a.out_dir}/samples_guard_off.png")
             print(f"[colab] mean |guard-on - guard-off| = {d:.4f} of full scale "
@@ -254,8 +259,16 @@ def main():
                    ref_source=a.ref_npz or a.ref_source,
                    precision=a.precision, fid=float(fid),
                    prec=float(prec), recall=float(rec))
-    json.dump(rec_out, open(f"{a.out_dir}/score.json", "w"), indent=1)
+    # Append, replacing only this exact (ckpt, weights) pair, so the file
+    # accumulates a trajectory across calls the way ddgpu.generate's does.
+    path = f"{a.out_dir}/scores.json"
+    recs = json.load(open(path)) if os.path.exists(path) else []
+    recs = [r for r in recs if not (r.get("ckpt") == rec_out["ckpt"]
+                                    and r.get("weights") == rec_out["weights"])]
+    recs = sorted(recs + [rec_out], key=lambda r: (r.get("step") or 0))
+    json.dump(recs, open(path, "w"), indent=1)
     print(json.dumps(rec_out, indent=1))
+    print(f"[colab] {len(recs)} record(s) in {path}")
     if len(f_fake) < 50000:
         print(f"[colab] NOTE: FID over {len(f_fake)} samples is biased upward and is "
               "NOT comparable\n  to published 50k numbers. Use --fid-n 50000 for that.")

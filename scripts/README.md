@@ -18,6 +18,7 @@ scripts/
   colab_check.py  grid + FID for one checkpoint, on a box with no training data
   sample_stats.py what KIND of wrong a sample grid is: noise / blur / layout / collapse
   teacher_sample.py multi-step Heun sample of the TEACHER -- the ceiling, before distilling
+  upload_ckpts.py strip a run's checkpoints to ~1/3 and push them to the Hub
   train.sh        single entry point for a training run
   eval_all.sh     score every run and print the matched-wall-clock table
   mkconfig.py     generates run configs (they are not hand-maintained -- see below)
