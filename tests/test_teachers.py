@@ -259,8 +259,21 @@ def t_conv_gan_head():
     s = torch.rand(4) * 2 + 0.1
     out = h(x, s)
     check("ConvGANHead -> (B,) logit", tuple(out.shape) == (4,), str(tuple(out.shape)))
-    check("hinge/NS losses are finite",
+    check("losses are finite",
           torch.isfinite(d_loss(out, out)) and torch.isfinite(g_loss(out)))
+    # Softplus, matching DMD2 -- and BOUNDED, unlike the -logit.mean() it
+    # replaced. An unbounded generator reward is a plausible cause of the
+    # degenerate samples in DMD2_DIFF.md; pin that it saturates.
+    z = torch.zeros(4)
+    check("d_loss at zero logits is 2*log(2)",
+          abs(float(d_loss(z, z)) - 2 * math.log(2)) < 1e-5, f"{float(d_loss(z,z)):.4f}")
+    check("g_loss at zero logits is log(2)",
+          abs(float(g_loss(z)) - math.log(2)) < 1e-5, f"{float(g_loss(z)):.4f}")
+    check("g_loss saturates once the discriminator is fooled",
+          float(g_loss(torch.full((4,), 20.0))) < 1e-6,
+          f"{float(g_loss(torch.full((4,), 20.0))):.3e}")
+    check("g_loss is bounded below by 0 (the old -logit.mean() was not)",
+          float(g_loss(torch.full((4,), 1e3))) >= 0.0)
 
 
 # --------------------------------------------------------------------------

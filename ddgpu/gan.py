@@ -40,13 +40,28 @@ class GANHead(nn.Module):
 
 
 def d_loss(logit_real, logit_fake):
-    """Hinge loss for the discriminator."""
-    return (F.relu(1 - logit_real).mean() + F.relu(1 + logit_fake).mean()) * 0.5
+    """Softplus (logistic) discriminator loss, as DMD2 uses.
+
+    Was hinge. DMD2's `compute_guidance_clean_cls_loss` is
+    `softplus(pred_on_fake) + softplus(-pred_on_real)`, and matching it removes
+    one difference from the reference. Uninformative value is 2*log(2) = 1.386,
+    where hinge's was 1.0.
+    """
+    return F.softplus(logit_fake).mean() + F.softplus(-logit_real).mean()
 
 
 def g_loss(logit_fake):
-    """Non-saturating generator loss."""
-    return -logit_fake.mean()
+    """Non-saturating generator loss, BOUNDED.
+
+    Was `-logit_fake.mean()`, which is unbounded: the generator is rewarded
+    without limit for driving the logit up, and nothing stops it walking off
+    into whatever direction the discriminator happens to score highly. DMD2 uses
+    `softplus(-pred_on_fake)`, which saturates once the discriminator is fooled
+    and the gradient vanishes. See DMD2_DIFF.md -- with a mean-pooling head,
+    the unbounded version is a plausible cause of the degenerate near-black
+    samples in LOG ENTRY 015's successor run.
+    """
+    return F.softplus(-logit_fake).mean()
 
 
 class ConvGANHead(nn.Module):
