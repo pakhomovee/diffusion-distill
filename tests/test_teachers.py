@@ -310,11 +310,11 @@ def t_unet_trunk():
                        up_block_types=("AttnUpBlock2D", "UpBlock2D")).eval()
     ad = DiffusersUNetAdapter(unet, class_conditional=False)
 
-    tok_dim, cond_dim = ad.trunk_dims
-    check("trunk_dims reports mid channels and time-embedding width",
-          tok_dim == unet.config.block_out_channels[-1]
-          and cond_dim == unet.time_embedding.linear_2.out_features,
-          f"{tok_dim}, {cond_dim}")
+    tok_dim, side = ad.trunk_spatial
+    want_side = unet.config.sample_size // 2 ** (len(unet.config.block_out_channels) - 1)
+    check("trunk_spatial reports mid channels and bottleneck side",
+          tok_dim == unet.config.block_out_channels[-1] and side == want_side,
+          f"{tok_dim}, {side} (want side {want_side})")
 
     x = torch.randn(2, 3, 8, 8)
     t = torch.tensor([13.0, 700.0])
@@ -339,8 +339,9 @@ def t_unet_trunk():
     check("trunk conditioning == the real forward's time embedding",
           torch.allclose(cond, grabbed["emb"], atol=1e-6),
           f"max|d| {(cond - grabbed['emb']).abs().max().item():.2e}")
-    check("token width matches trunk_dims", tok.shape[-1] == tok_dim)
-    check("cond width matches trunk_dims", cond.shape[-1] == cond_dim)
+    check("token width matches trunk_spatial", tok.shape[-1] == tok_dim)
+    check("tokens reshape back to the bottleneck grid",
+          tok.shape[1] == side * side, f"{tok.shape[1]} vs {side*side}")
 
     # Features must actually depend on the input -- a constant would pass the
     # shape checks and make the discriminator useless.
@@ -349,26 +350,56 @@ def t_unet_trunk():
     check("trunk features vary with the input",
           (tok - tok2).abs().max().item() > 1e-4)
 
-    # And the head must accept the two different widths.
-    head = GANHead(tok_dim, cond_dim)
+    # And DMD2's conv head must score the bottleneck, spatially.
+    head = GANHead(tok_dim, side)
+    feat = tok.transpose(1, 2).reshape(tok.shape[0], tok_dim, side, side)
+    check("tokens -> (B,C,H,W) is the exact inverse of trunk's flatten",
+          torch.equal(feat, grabbed["mid"]),
+          f"max|d| {(feat - grabbed['mid']).abs().max().item():.2e}")
     with torch.no_grad():
-        logit = head(tok, cond)
+        logit = head(feat)
     check("GANHead on UNet features -> (B,) finite logit",
           logit.shape == (2,) and bool(torch.isfinite(logit).all()),
           str(tuple(logit.shape)))
     check("hinge/NS losses finite on it",
           bool(torch.isfinite(d_loss(logit, logit)) and torch.isfinite(g_loss(logit))))
 
-    # The DiT path must be unchanged: equal widths, single-argument GANHead.
+    # The head must depend on its input at all. GroupNorm over a 1x1 map with
+    # one channel per group is identically zero, which made the whole head emit
+    # a constant and pass every shape check while delivering no gradient to the
+    # critic -- observed as two identical logits and a grad norm of exactly 0.
+    with torch.no_grad():
+        other = head(torch.randn_like(feat))
+    check("the head is not constant in its input",
+          (logit - other).abs().max().item() > 1e-6,
+          f"max|d| {(logit - other).abs().max().item():.2e}")
+    # Recompute WITH grad -- `feat` above came from a no_grad block, so it has
+    # no graph back to the critic and would trivially report zero.
+    gtok, _ = ad.trunk(x, t)
+    gfeat = gtok.transpose(1, 2).reshape(gtok.shape[0], tok_dim, side, side)
+    gsum = torch.autograd.grad(head(gfeat).sum(),
+                               [q for q in unet.parameters() if q.requires_grad],
+                               allow_unused=True)
+    gn = sum(float((q * q).sum()) for q in gsum if q is not None) ** 0.5
+    check("gradient actually reaches the critic through the head", gn > 0.0,
+          f"grad norm {gn:.3e}")
+    from ddgpu.gan import _groups
+    check("every GroupNorm in the head has >=4 channels per group",
+          all(m.num_channels // m.num_groups >= 4
+              for m in head.net if isinstance(m, torch.nn.GroupNorm)),
+          str([(m.num_groups, m.num_channels) for m in head.net
+               if isinstance(m, torch.nn.GroupNorm)]))
+
+    # A DiT's tokens are a patch grid, so the same head applies there too.
     from ddgpu.dit import make_dit
     dit = make_dit("DiT-T/2", input_size=8, in_ch=3, n_classes=2)
-    td, cd = dit.trunk_dims
-    check("DiT trunk_dims are equal widths (the old assumption)", td == cd,
-          f"{td}, {cd}")
-    dtok, dcond = dit.trunk(torch.randn(2, 3, 8, 8), torch.tensor([1.0, 2.0]),
-                            torch.zeros(2, dtype=torch.long))
-    check("GANHead(hidden) still works on DiT features",
-          GANHead(td)(dtok, dcond).shape == (2,))
+    td, ds = dit.trunk_spatial
+    check("DiT reports its patch grid", (td, ds) == (64, 4), f"{td}, {ds}")
+    dtok, _ = dit.trunk(torch.randn(2, 3, 8, 8), torch.tensor([1.0, 2.0]),
+                        torch.zeros(2, dtype=torch.long))
+    dfeat = dtok.transpose(1, 2).reshape(2, td, ds, ds)
+    check("the same conv head scores DiT features",
+          GANHead(td, ds)(dfeat).shape == (2,))
 
 
 # --------------------------------------------------------------------------

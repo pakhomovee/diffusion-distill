@@ -68,8 +68,8 @@ class DMD2Trainer:
             # ConvGANHead -- and LOG ENTRY 015 measured that substitute
             # collapsing the baseline. Anything that reports both widths now
             # gets DMD2's actual head on the critic's own features.
-            if hasattr(base, "trunk") and hasattr(base, "trunk_dims"):
-                self.gan = GANHead(*base.trunk_dims).to(device)
+            if hasattr(base, "trunk") and hasattr(base, "trunk_spatial"):
+                self.gan = GANHead(*base.trunk_spatial).to(device)
                 self.gan_kind = "trunk"
             else:
                 self.gan = ConvGANHead(cfg["shape"][0], res=cfg["shape"][-1]).to(device)
@@ -112,8 +112,15 @@ class DMD2Trainer:
             return self.gan(x, sigma)
         net = _raw(self.mu)
         cs, co, ci, cn = net._coef(sigma)
-        tok, cond = net.net.trunk(ci.reshape(-1, 1, 1, 1) * x, cn, y)
-        return self.gan(tok, cond)
+        tok, _ = net.net.trunk(ci.reshape(-1, 1, 1, 1) * x, cn, y)
+        # Back to (B, C, H, W). `trunk` returns tokens because a DiT's body is
+        # token-shaped, but DMD2's head convolves over the bottleneck's spatial
+        # extent -- so undo the flatten. Exact inverse of the UNet adapter's
+        # `h.flatten(2).transpose(1, 2)`; for a DiT the tokens are a patch grid,
+        # which is the same arrangement.
+        ch, side = net.net.trunk_spatial
+        feat = tok.transpose(1, 2).reshape(tok.shape[0], ch, side, side)
+        return self.gan(feat)
 
     # ---------------- student ------------------------------------------
     def generate(self, n, y, z=None, grad=True):

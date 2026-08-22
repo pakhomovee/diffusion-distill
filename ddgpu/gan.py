@@ -15,28 +15,69 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class GANHead(nn.Module):
-    """DMD2's discriminator: a head on the CRITIC's own features.
+def _groups(c, min_per_group=4):
+    """Largest GroupNorm group count that divides c, capped at DMD2's 32.
 
-    `cond_dim` defaults to `hidden` because a DiT's token width and conditioning
-    width are the same. A UNet's are not -- `ddpm-cifar10-32` has 256-channel
-    mid-block features and a 512-wide time embedding -- so the two are separate
-    parameters and the adapter reports both via `trunk_dims`.
+    Also requires at least `min_per_group` channels per group, which is not
+    fussiness. The second conv lands on 1x1, so GroupNorm there normalises over
+    (channels_per_group * 1 * 1) values -- and with ONE channel per group that
+    is a single number, whose normalisation is identically zero. The head then
+    emits a constant and no gradient reaches the critic at all: caught with a
+    16-channel bottleneck, where both logits came back 0.0822 and the gradient
+    norm into the UNet was exactly 0.
+
+    DMD2 never hits this (768 channels / 32 groups = 24 per group), and neither
+    does ddpm-cifar10-32 (256 / 32 = 8), but a small model does.
+    """
+    return next((g for g in (32, 16, 8, 4, 2, 1)
+                 if c % g == 0 and c // g >= min_per_group), 1)
+
+
+class GANHead(nn.Module):
+    """DMD2's discriminator: strided convs on the CRITIC's bottleneck.
+
+    Mirrors `main/edm/edm_guidance.py`'s `cls_pred_branch`, which on
+    ImageNet-64 is
+
+        Conv2d(768 -> 768, k4 s2 p1)   8x8 -> 4x4
+        GroupNorm(32), SiLU
+        Conv2d(768 -> 768, k4 s4 p0)   4x4 -> 1x1
+        GroupNorm(32), SiLU
+        Conv2d(768 -> 1,   k1)
+
+    generalised over the bottleneck's spatial size, because ddpm-cifar10-32's
+    bottleneck is 4x4x256 rather than 8x8x768. The second conv's kernel and
+    stride are both `spatial // 2`, so it always lands on 1x1 -- the same
+    two-strided-convs-then-pointwise shape DMD2 uses.
+
+    Deliberately UNCONDITIONED. DMD2's head takes only the bottleneck; the noise
+    level is already in those features because the critic's own forward was
+    given it. The previous version applied adaLN from the time embedding, which
+    the reference does not.
+
+    And it keeps the spatial extent. The previous version did `out(h.mean(1))`,
+    mean-pooling the tokens before classifying -- so a global shift in the
+    feature average was enough to satisfy it, which is what the degenerate run's
+    channel statistics looked like. See DMD2_DIFF.md.
     """
 
-    def __init__(self, hidden, cond_dim=None):
+    def __init__(self, in_ch, spatial):
         super().__init__()
-        cond_dim = hidden if cond_dim is None else cond_dim
-        self.norm = nn.LayerNorm(hidden, elementwise_affine=False, eps=1e-6)
-        self.ada = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, 2 * hidden))
-        self.out = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(),
-                                 nn.Linear(hidden, 1))
-        nn.init.zeros_(self.ada[1].weight); nn.init.zeros_(self.ada[1].bias)
+        s = int(spatial)
+        if s < 2:
+            raise ValueError(f"bottleneck must be at least 2x2, got {s}")
+        layers = [nn.Conv2d(in_ch, in_ch, 4, 2, 1),
+                  nn.GroupNorm(_groups(in_ch), in_ch), nn.SiLU()]
+        mid = s // 2
+        if mid > 1:                       # collapse whatever is left to 1x1
+            layers += [nn.Conv2d(in_ch, in_ch, mid, mid, 0),
+                       nn.GroupNorm(_groups(in_ch), in_ch), nn.SiLU()]
+        layers.append(nn.Conv2d(in_ch, 1, 1, 1, 0))
+        self.net = nn.Sequential(*layers)
 
-    def forward(self, tokens, cond):
-        s, g = self.ada(cond).chunk(2, dim=-1)
-        h = self.norm(tokens) * (1 + g.unsqueeze(1)) + s.unsqueeze(1)
-        return self.out(h.mean(1)).squeeze(-1)          # (B,) logit
+    def forward(self, feat):
+        """feat: (B, C, H, W) bottleneck -> (B,) logit."""
+        return self.net(feat).flatten(1).mean(1)
 
 
 def d_loss(logit_real, logit_fake):

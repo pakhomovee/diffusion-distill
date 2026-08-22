@@ -138,14 +138,15 @@ class DiT(nn.Module):
         return x.reshape(B, c, g * p, g * p)
 
     @property
-    def trunk_dims(self):
-        """(token width, conditioning width) for a discriminator head.
+    def trunk_spatial(self):
+        """(channels, side) of `trunk`'s features viewed as a 2D grid.
 
-        Reported rather than introspected: `DMD2Trainer` used to read
-        `final.lin.in_features`, which only happens to be right because a DiT's
-        token and conditioning widths coincide. A UNet's do not.
+        DMD2's discriminator convolves over the critic's bottleneck, so the head
+        needs the spatial layout, not just a width. A DiT's tokens ARE a grid --
+        one per patch -- so they reshape to (B, hidden, g, g) with g the patch
+        grid side.
         """
-        return self.final.lin.in_features, self.final.lin.in_features
+        return self.final.lin.in_features, self.grid
 
     def trunk(self, x, t, y, force_drop=None):
         """Shared body. Returns (tokens, conditioning) so a discriminator head

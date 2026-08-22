@@ -60,14 +60,17 @@ class DiffusersUNetAdapter(nn.Module):
         return self.unet(x, t).sample
 
     @property
-    def trunk_dims(self):
-        """(token width, conditioning width) for `gan.GANHead`.
+    def trunk_spatial(self):
+        """(channels, side) of the mid-block output.
 
-        Mid-block channels and time-embedding width, which for a UNet are
-        different numbers -- 256 and 512 on `ddpm-cifar10-32`.
+        UNet2DModel adds a downsampler to every down block except the last, so
+        the bottleneck side is sample_size // 2**(len(block_out_channels) - 1).
+        For ddpm-cifar10-32 that is 32 // 8 = 4, at 256 channels -- where DMD2's
+        ImageNet-64 bottleneck is 8x8 at 768. `gan.GANHead` adapts.
         """
-        mid = self.unet.config.block_out_channels[-1]
-        return int(mid), int(self.unet.time_embedding.linear_2.out_features)
+        cfg = self.unet.config
+        side = int(cfg.sample_size) // 2 ** (len(cfg.block_out_channels) - 1)
+        return int(cfg.block_out_channels[-1]), side
 
     def trunk(self, x, t, y=None, force_drop=None):
         """Encoder + mid block, as (tokens, conditioning).
