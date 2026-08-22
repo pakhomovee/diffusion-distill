@@ -93,6 +93,10 @@ class DMD2Trainer:
             return self.sch.student_sigmas(n, sigma_max=self.c["sigma_max"]).to(self.dev)
         return edm_sigmas(n, sigma_max=self.c["sigma_max"], device=self.dev)
 
+    def _diag_step(self):
+        """Steps train.py will actually log -- see the note by gan_pull."""
+        return (self.step_i + 1) % max(int(self.c.get("log_every", 50)), 1) == 0
+
     def _disc(self, x, sigma, y):
         """Discriminator logit."""
         if self.gan_kind == "conv":
@@ -173,13 +177,32 @@ class DMD2Trainer:
             with torch.no_grad():
                 yg = torch.randint(0, c["n_classes"], (n,), device=self.dev)
                 xg = self.generate(n, yg, grad=False)
-            ld = self.critic_loss(xg)
+            ld_dsm = self.critic_loss(xg)
+            ld = ld_dsm
             if self.gan is not None:
                 sg = self.sample_sigma(n, self.dev)
                 v = sg.reshape(-1, 1, 1, 1)
                 xr_n = real_batch + v * torch.randn_like(real_batch)
                 xg_n = xg + v * torch.randn_like(xg)
                 lgan = d_loss(self._disc(xr_n, sg, real_y), self._disc(xg_n, sg, yg))
+                # The OTHER half of the GAN's influence, and the one that is
+                # easy to forget: with the trunk head the adversarial loss
+                # backprops into the CRITIC's own weights, because the head sits
+                # on the critic's features and opt_D holds both. ConvGANHead was
+                # a separate network and never did this. Since the critic
+                # supplies s_fake to dm_loss, corrupting it corrupts the
+                # distribution-matching gradient indirectly -- which gan_pull,
+                # measured at the generator, cannot see.
+                if self._diag_step() and not _is_ddp(self.mu):
+                    ps = [p for p in _raw(self.mu).parameters() if p.requires_grad]
+                    nrm = lambda gs: torch.sqrt(sum(
+                        (g * g).sum() for g in gs if g is not None)).item()
+                    a = nrm(torch.autograd.grad(ld_dsm, ps, retain_graph=True,
+                                                allow_unused=True))
+                    b = nrm(torch.autograd.grad(c["gan_weight"] * lgan, ps,
+                                                retain_graph=True, allow_unused=True))
+                    logs["cnorm_dsm"], logs["cnorm_gan"] = a, b
+                    logs["gan_pull_critic"] = b / max(a, 1e-12)
                 ld = ld + c["gan_weight"] * lgan
                 logs["loss_gan_d"] = lgan.item()
             self.opt_D.zero_grad(set_to_none=True)
@@ -220,7 +243,7 @@ class DMD2Trainer:
             # it = 50, 100, 150. They never coincide, and the numbers were
             # computed and discarded. Firing on steps that are actually logged
             # is the only cadence that works.
-            if (self.step_i + 1) % max(int(c.get("log_every", 50)), 1) == 0:
+            if self._diag_step():
                 gd = torch.autograd.grad(lg, xg, retain_graph=True)[0].norm()
                 gg = torch.autograd.grad(c["gan_weight"] * lga, xg,
                                          retain_graph=True)[0].norm()
@@ -278,3 +301,14 @@ class DMD2Trainer:
 def _raw(m):
     """Unwrap DDP."""
     return m.module if hasattr(m, "module") else m
+
+
+def _is_ddp(m):
+    """Diagnostics that call autograd.grad on parameters must sit this out.
+
+    DDP registers autograd hooks on the parameters themselves, so an extra grad
+    pass marks buckets ready a second time and trips the reducer -- the same
+    constraint that makes `generate` grad-track only one step of a few-step
+    student. Single-GPU runs, which is where calibration happens, are unaffected.
+    """
+    return hasattr(m, "module")
