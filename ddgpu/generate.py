@@ -168,6 +168,11 @@ def build_argparser():
     ap.add_argument("--name", default=None)
     ap.add_argument("--out", default="results/runs.json")
     ap.add_argument("--grid", type=int, default=64, help="also save an NxN sample grid")
+    ap.add_argument("--precision", default="bf16", choices=["bf16", "fp32"],
+                    help="bf16 matches training's default autocast (config `amp`). "
+                         "fp32 is the exact reference: use it when the run was "
+                         "trained with --set amp=false, or to check that "
+                         "VPPrecond's guard is doing its job.")
     return ap
 
 
@@ -217,12 +222,25 @@ def main():
         print(f"[generate] preflight OK: reference {tuple(f_real.shape)}, "
               "FID and precision/recall callable", flush=True)
 
+    # Scoring precision was hardcoded to bf16 while TRAINING precision is
+    # configurable (`amp`), so a run trained in fp32 could not be scored in fp32
+    # without editing this file. VPPrecond's guard already forces fp32 at high
+    # sigma, so bf16 here is not the FID-325 failure -- but "exactly what was
+    # trained" should be expressible.
+    use_bf16 = a.precision == "bf16" and dev.type == "cuda"
+    if use_bf16 and not torch.cuda.is_bf16_supported():
+        if rank == 0:
+            print("[generate] no bf16 on this GPU; sampling in fp32")
+        use_bf16 = False
+    if rank == 0:
+        print(f"[generate] sampling precision: {'bf16 autocast' if use_bf16 else 'fp32'}")
+
     per = (a.n + world - 1) // world
     gen = torch.Generator(device=dev).manual_seed(1234 + rank)
     feats, grid_imgs, done = [], [], 0
     while done < per:
         b = min(a.batch, per - done)
-        with torch.autocast(dev.type, torch.bfloat16, enabled=(dev.type == "cuda")):
+        with torch.autocast(dev.type, torch.bfloat16, enabled=use_bf16):
             z, _ = sample_batch(G, b, c, sch, dev, gen)
         imgs = decode(z, vae, scale)
         feats.append(inception_feats(inc, imgs, dev, a.batch))
@@ -243,7 +261,8 @@ def main():
                   gpu_seconds=ck.get("gpu_seconds", 0.0), n_gpus=ck.get("n_gpus", 1),
                   step=ck.get("it", 0), fid=fid, precision=prec, recall=rec,
                   nfe=c["n_student_steps"],
-                  extra=dict(weights=a.weights, n=len(f_fake), ckpt=ck_path))
+                  extra=dict(weights=a.weights, n=len(f_fake), ckpt=ck_path,
+                             precision=a.precision))
     print(json.dumps(r.as_dict(), indent=1))
 
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
