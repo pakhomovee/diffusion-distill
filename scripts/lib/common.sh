@@ -26,11 +26,25 @@ setup_autodl_network() {
 # Route HF traffic through hf-mirror.com and disable the Xet chunked-transfer
 # backend, whose CAS server 401s through the network_turbo proxy. Only sets env
 # vars, so it runs even with --skip-setup. Honors anything already exported.
+# The mirror is for AutoDL ONLY, gated on the same marker ddgpu/hfenv.py uses
+# and for the reason its docstring gives: routing a European or US box through a
+# China mirror is the opposite of a speed-up. This used to be unconditional,
+# which meant every non-AutoDL box silently got it -- and `--skip-setup` does
+# not help, because train.sh calls this before that guard.
+#
+# Anything already exported still wins, so `export HF_ENDPOINT=https://huggingface.co`
+# overrides it on an AutoDL box too. HF_HUB_DISABLE_XET stays on everywhere: Xet
+# crawls behind the AutoDL proxy and chunks in memory on small containers (it is
+# half of the upload_ckpts OOM). Set HF_HUB_DISABLE_XET=0 to get it back.
+AUTODL_MARKER="${AUTODL_MARKER:-/etc/network_turbo}"
+
 setup_hf_env() {
-  export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+  if [[ -e "$AUTODL_MARKER" ]]; then
+    export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+  fi
   export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
   export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
-  log "HF_ENDPOINT=$HF_ENDPOINT HF_HUB_DISABLE_XET=$HF_HUB_DISABLE_XET"
+  log "HF_ENDPOINT=${HF_ENDPOINT:-<hub default>} HF_HUB_DISABLE_XET=$HF_HUB_DISABLE_XET"
 }
 
 # --- Python environment -----------------------------------------------------
