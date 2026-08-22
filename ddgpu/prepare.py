@@ -145,7 +145,16 @@ class TorchvisionImages(torch.utils.data.Dataset):
             os.path.expanduser(root), train=train, download=True)
         self.res, self.n_classes = resolution, ncls
         self.classes = [str(i) for i in range(ncls)]
-        self.samples = [(None, int(y)) for _, y in self.ds]
+        # `.targets` rather than iterating. `for _, y in self.ds` calls
+        # __getitem__ 50 000 times and each call builds a PIL image via
+        # Image.fromarray, just to read a label torchvision is already holding
+        # in a list -- tens of seconds of pure waste, and much worse on a
+        # network-backed disk. The fallback keeps any dataset class that does
+        # not expose targets working.
+        targets = getattr(self.ds, "targets", None)
+        if targets is None:
+            targets = [y for _, y in self.ds]
+        self.samples = [(None, int(y)) for y in targets]
 
     def __len__(self):
         return len(self.ds)
