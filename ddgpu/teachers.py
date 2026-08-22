@@ -219,7 +219,7 @@ def _load_dit(path, device, n_classes=1000, in_ch=4, sigma_data=1.0, **kw):
 def _load_diffusers(repo, device, sigma_data=0.5, **kw):
     try:
         from diffusers import UNet2DModel
-    except (AttributeError, ImportError) as e:
+    except (AttributeError, ImportError, RuntimeError) as e:
         # A diffusers newer than the installed torch. The usual shape is
         # `module 'torch' has no attribute 'xpu'` from diffusers/utils/
         # torch_utils.py, because torch.xpu only exists from torch 2.4 -- and it
@@ -234,6 +234,13 @@ def _load_diffusers(repo, device, sigma_data=0.5, **kw):
             "               needs torch >= 2.4 and diffusers touches it on import\n"
             "    too OLD -> \"cannot import name 'cached_download'\"; huggingface_hub\n"
             "               dropped it in 0.26, diffusers <= 0.28 still imports it\n"
+            "    third  -> \"huggingface-hub>=0.19.3,<1.0 is required ... found\n"
+            "               huggingface-hub==1.x\". Not diffusers at all: it imports\n"
+            "               transformers ONLY when transformers is installed\n"
+            "               (`if is_transformers_available()`), and transformers 4.x\n"
+            "               pins hub <1.0 while 5.0+ pins >=1.3,<2. Fix with\n"
+            "                 pip install -U 'transformers>=5'\n"
+            "               or, since nothing here uses transformers, remove it.\n"
             "  Checked against the published wheels: 0.29.2-0.32.2 contain neither\n"
             "  reference. 0.31.0 mentions torch.xpu and cached_download zero times\n"
             "  anywhere in the package and imports only hf_hub_download/model_info\n"
