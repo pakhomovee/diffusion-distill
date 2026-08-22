@@ -23,7 +23,9 @@
 #       --config FILE       use this config verbatim, skipping generation
 #       --resume [PATH]     resume ('auto' = latest checkpoint in the run dir)
 #       --prepare           build latents + FID reference before training
-#       --skip-setup        skip network/python setup
+#       --skip-setup        skip the AutoDL network tweak and the pip install
+#                           (which otherwise runs on EVERY launch). Does NOT
+#                           skip setup_hf_env -- that runs before this guard.
 #       --dry-run           print the launch command and exit
 #       --set k=v           extra config overrides (repeatable)
 #   --                      everything after this is passed to ddgpu.train
