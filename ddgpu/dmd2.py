@@ -213,7 +213,14 @@ class DMD2Trainer:
             # to be measured. Taken w.r.t. the SAMPLES rather than the
             # parameters: it is the same ratio, needs no second parameter
             # backward, and cannot upset DDP's reducer.
-            if self.step_i % c.get("diag_every", 500) == 0:
+            # Aligned to log_every, NOT diag_every. `step_i` is 0-based and
+            # incremented at the end of this method, while train.py logs at
+            # `it % log_every == 0` AFTER incrementing -- so a diag_every of 100
+            # against a log_every of 50 fires on it = 1, 101, 201 and logs on
+            # it = 50, 100, 150. They never coincide, and the numbers were
+            # computed and discarded. Firing on steps that are actually logged
+            # is the only cadence that works.
+            if (self.step_i + 1) % max(int(c.get("log_every", 50)), 1) == 0:
                 gd = torch.autograd.grad(lg, xg, retain_graph=True)[0].norm()
                 gg = torch.autograd.grad(c["gan_weight"] * lga, xg,
                                          retain_graph=True)[0].norm()
