@@ -137,6 +137,16 @@ class DiT(nn.Module):
         x = x.reshape(B, g, g, p, p, c).permute(0, 5, 1, 3, 2, 4)
         return x.reshape(B, c, g * p, g * p)
 
+    @property
+    def trunk_dims(self):
+        """(token width, conditioning width) for a discriminator head.
+
+        Reported rather than introspected: `DMD2Trainer` used to read
+        `final.lin.in_features`, which only happens to be right because a DiT's
+        token and conditioning widths coincide. A UNet's do not.
+        """
+        return self.final.lin.in_features, self.final.lin.in_features
+
     def trunk(self, x, t, y, force_drop=None):
         """Shared body. Returns (tokens, conditioning) so a discriminator head
         can reuse the critic's features instead of paying for its own network --

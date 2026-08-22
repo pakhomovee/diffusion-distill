@@ -16,10 +16,19 @@ import torch.nn.functional as F
 
 
 class GANHead(nn.Module):
-    def __init__(self, hidden):
+    """DMD2's discriminator: a head on the CRITIC's own features.
+
+    `cond_dim` defaults to `hidden` because a DiT's token width and conditioning
+    width are the same. A UNet's are not -- `ddpm-cifar10-32` has 256-channel
+    mid-block features and a 512-wide time embedding -- so the two are separate
+    parameters and the adapter reports both via `trunk_dims`.
+    """
+
+    def __init__(self, hidden, cond_dim=None):
         super().__init__()
+        cond_dim = hidden if cond_dim is None else cond_dim
         self.norm = nn.LayerNorm(hidden, elementwise_affine=False, eps=1e-6)
-        self.ada = nn.Sequential(nn.SiLU(), nn.Linear(hidden, 2 * hidden))
+        self.ada = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, 2 * hidden))
         self.out = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(),
                                  nn.Linear(hidden, 1))
         nn.init.zeros_(self.ada[1].weight); nn.init.zeros_(self.ada[1].bias)

@@ -264,12 +264,108 @@ def t_conv_gan_head():
 
 
 # --------------------------------------------------------------------------
+def t_unet_trunk():
+    """`DiffusersUNetAdapter.trunk` must return the UNet's OWN mid-block features.
+
+    DMD2's discriminator is a head on the critic's features, not a separate
+    network. `trunk()` makes that available on a diffusers backbone by replaying
+    `UNet2DModel.forward` steps 0-4 and stopping at the bottleneck -- which
+    couples us to diffusers' layout. A release that reorders those steps would
+    not raise; it would feed the discriminator the wrong tensor and show up as
+    "the GAN term does not help", which is unfalsifiable from the outside.
+
+    So this captures the mid-block activation from a REAL `unet(...)` call with
+    a hook and demands `trunk()` reproduce it exactly. LOG ENTRY 015 is why it
+    matters: the standalone ConvGANHead that stood in for this collapsed the
+    baseline it was meant to represent.
+    """
+    try:
+        from diffusers import UNet2DModel
+    except ImportError:
+        print("  SKIP  diffusers not installed")
+        return
+    from ddgpu.teachers import DiffusersUNetAdapter
+    from ddgpu.gan import GANHead, d_loss, g_loss
+
+    torch.manual_seed(0)
+    # norm_num_groups=4, not the default 32: this box has ~1 GB of usable RAM
+    # and GroupNorm would otherwise force block_out_channels up to 32+.
+    unet = UNet2DModel(sample_size=8, in_channels=3, out_channels=3,
+                       layers_per_block=1, block_out_channels=(8, 16),
+                       norm_num_groups=4, attention_head_dim=8,
+                       down_block_types=("DownBlock2D", "AttnDownBlock2D"),
+                       up_block_types=("AttnUpBlock2D", "UpBlock2D")).eval()
+    ad = DiffusersUNetAdapter(unet, class_conditional=False)
+
+    tok_dim, cond_dim = ad.trunk_dims
+    check("trunk_dims reports mid channels and time-embedding width",
+          tok_dim == unet.config.block_out_channels[-1]
+          and cond_dim == unet.time_embedding.linear_2.out_features,
+          f"{tok_dim}, {cond_dim}")
+
+    x = torch.randn(2, 3, 8, 8)
+    t = torch.tensor([13.0, 700.0])
+
+    grabbed = {}
+    h = unet.mid_block.register_forward_hook(
+        lambda m, i, o: grabbed.__setitem__("mid", o.detach().clone()))
+    h2 = unet.time_embedding.register_forward_hook(
+        lambda m, i, o: grabbed.__setitem__("emb", o.detach().clone()))
+    with torch.no_grad():
+        unet(x, t)
+    h.remove(); h2.remove()
+
+    with torch.no_grad():
+        tok, cond = ad.trunk(x, t)
+
+    want = grabbed["mid"].flatten(2).transpose(1, 2)
+    check("trunk tokens == the real forward's mid-block activation",
+          tok.shape == want.shape and torch.allclose(tok, want, atol=1e-6),
+          f"{tuple(tok.shape)} vs {tuple(want.shape)}, "
+          f"max|d| {(tok - want).abs().max().item():.2e}")
+    check("trunk conditioning == the real forward's time embedding",
+          torch.allclose(cond, grabbed["emb"], atol=1e-6),
+          f"max|d| {(cond - grabbed['emb']).abs().max().item():.2e}")
+    check("token width matches trunk_dims", tok.shape[-1] == tok_dim)
+    check("cond width matches trunk_dims", cond.shape[-1] == cond_dim)
+
+    # Features must actually depend on the input -- a constant would pass the
+    # shape checks and make the discriminator useless.
+    with torch.no_grad():
+        tok2, _ = ad.trunk(torch.randn(2, 3, 8, 8), t)
+    check("trunk features vary with the input",
+          (tok - tok2).abs().max().item() > 1e-4)
+
+    # And the head must accept the two different widths.
+    head = GANHead(tok_dim, cond_dim)
+    with torch.no_grad():
+        logit = head(tok, cond)
+    check("GANHead on UNet features -> (B,) finite logit",
+          logit.shape == (2,) and bool(torch.isfinite(logit).all()),
+          str(tuple(logit.shape)))
+    check("hinge/NS losses finite on it",
+          bool(torch.isfinite(d_loss(logit, logit)) and torch.isfinite(g_loss(logit))))
+
+    # The DiT path must be unchanged: equal widths, single-argument GANHead.
+    from ddgpu.dit import make_dit
+    dit = make_dit("DiT-T/2", input_size=8, in_ch=3, n_classes=2)
+    td, cd = dit.trunk_dims
+    check("DiT trunk_dims are equal widths (the old assumption)", td == cd,
+          f"{td}, {cd}")
+    dtok, dcond = dit.trunk(torch.randn(2, 3, 8, 8), torch.tensor([1.0, 2.0]),
+                            torch.zeros(2, dtype=torch.long))
+    check("GANHead(hidden) still works on DiT features",
+          GANHead(td)(dtok, dcond).shape == (2,))
+
+
+# --------------------------------------------------------------------------
 if __name__ == "__main__":
     for fn in (t_interpolant_map, t_interpolant_exact_on_gaussian,
                t_student_grid_signature, t_gaussian_teacher,
                t_validate_teacher_catches_miswrapping, t_teacher_spec_errors,
                t_dsm_identity, t_offline_matches_online,
-               t_pixel_dataset, t_gaussian_data, t_conv_gan_head):
+               t_pixel_dataset, t_gaussian_data, t_conv_gan_head,
+               t_unet_trunk):
         print(f"\n== {fn.__name__} ==")
         fn()
     print("\n" + ("ALL PASS" if not FAIL else f"{len(FAIL)} FAILED: {FAIL}"))

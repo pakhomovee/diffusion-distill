@@ -59,6 +59,61 @@ class DiffusersUNetAdapter(nn.Module):
             return self.unet(x, t, class_labels=y).sample
         return self.unet(x, t).sample
 
+    @property
+    def trunk_dims(self):
+        """(token width, conditioning width) for `gan.GANHead`.
+
+        Mid-block channels and time-embedding width, which for a UNet are
+        different numbers -- 256 and 512 on `ddpm-cifar10-32`.
+        """
+        mid = self.unet.config.block_out_channels[-1]
+        return int(mid), int(self.unet.time_embedding.linear_2.out_features)
+
+    def trunk(self, x, t, y=None, force_drop=None):
+        """Encoder + mid block, as (tokens, conditioning).
+
+        This is what makes DMD2's actual discriminator available on a diffusers
+        teacher. DMD2 hangs a small head on the CRITIC's own features rather
+        than training a separate network; `gan.ConvGANHead` exists only because
+        this method did not, and LOG ENTRY 015 measured that substitute
+        collapsing the baseline it was standing in for.
+
+        It replays `UNet2DModel.forward` steps 0-4 and stops at the bottleneck.
+        A forward hook would be less coupled to diffusers' layout but would have
+        to run the decoder too, and the discriminator is evaluated three times a
+        step. The coupling is checked rather than assumed:
+        `tests/test_teachers.py::t_unet_trunk` asserts these tokens equal the
+        mid-block activation captured from a real `unet(...)` call, so a
+        diffusers release that reorders this fails the test instead of silently
+        feeding the head the wrong features.
+        """
+        unet = self.unet
+        if unet.config.center_input_sample:
+            x = 2 * x - 1.0
+
+        t = torch.as_tensor(t, device=x.device)
+        if t.ndim == 0:
+            t = t[None]
+        t = t * torch.ones(x.shape[0], dtype=t.dtype, device=t.device)
+        emb = unet.time_embedding(unet.time_proj(t).to(dtype=unet.dtype))
+        if unet.class_embedding is not None:
+            if y is None:
+                raise ValueError("this UNet is class-conditional; trunk() needs y")
+            lab = unet.time_proj(y) if unet.config.class_embed_type == "timestep" else y
+            emb = emb + unet.class_embedding(lab).to(dtype=unet.dtype)
+
+        skip, h = x, unet.conv_in(x)
+        for blk in unet.down_blocks:
+            if hasattr(blk, "skip_conv"):
+                h, _, skip = blk(hidden_states=h, temb=emb, skip_sample=skip)
+            else:
+                h, _ = blk(hidden_states=h, temb=emb)
+        if unet.mid_block is not None:
+            h = unet.mid_block(h, emb)
+
+        # (B, C, h, w) -> (B, h*w, C), the token layout GANHead expects.
+        return h.flatten(2).transpose(1, 2), emb
+
 
 class SiTNetAdapter(nn.Module):
     """REPA/SiT -> our net signature.

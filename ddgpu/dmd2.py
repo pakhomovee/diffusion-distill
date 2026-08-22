@@ -62,8 +62,14 @@ class DMD2Trainer:
         self.gan, self.gan_kind = None, None
         if cfg.get("gan_weight", 0.0) > 0:
             base = getattr(_raw(critic), "net", None)
-            if hasattr(base, "trunk") and hasattr(base, "final"):
-                self.gan = GANHead(base.final.lin.in_features).to(device)
+            # `trunk_dims` rather than `final.lin.in_features`: the old probe
+            # only worked on our DiT, where the token and conditioning widths
+            # happen to be equal, so every third-party backbone fell through to
+            # ConvGANHead -- and LOG ENTRY 015 measured that substitute
+            # collapsing the baseline. Anything that reports both widths now
+            # gets DMD2's actual head on the critic's own features.
+            if hasattr(base, "trunk") and hasattr(base, "trunk_dims"):
+                self.gan = GANHead(*base.trunk_dims).to(device)
                 self.gan_kind = "trunk"
             else:
                 self.gan = ConvGANHead(cfg["shape"][0], res=cfg["shape"][-1]).to(device)
