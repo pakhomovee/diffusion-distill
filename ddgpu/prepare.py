@@ -379,14 +379,18 @@ def cmd_pixels(a):
     of fp16; the [-1,1] conversion happens in `PixelDataset`.
     """
     rank, world = _shard_id()
-    ds = image_source(a.source, a.resolution)
-    n, dest = len(ds), a.dest
-    os.makedirs(dest, exist_ok=True)
-    px_path, lab_path = f"{dest}/{a.split}_pixels.npy", f"{dest}/{a.split}_labels.npy"
+    dest = a.dest
     meta_path = f"{dest}/meta.json"
+    # Check BEFORE constructing the source. `image_source` DOWNLOADS -- 170 MB
+    # from cs.toronto.edu, or the 120 MB parquet -- so doing it first made
+    # "nothing to do" cost a full fetch on a box that was already prepared.
     if os.path.exists(meta_path) and not a.refresh:
         print(f"[pixels] {meta_path} exists; nothing to do (use --refresh)")
         return
+    ds = image_source(a.source, a.resolution)
+    n = len(ds)
+    os.makedirs(dest, exist_ok=True)
+    px_path, lab_path = f"{dest}/{a.split}_pixels.npy", f"{dest}/{a.split}_labels.npy"
 
     ready = f"{dest}/.alloc_done"
     if rank == 0:
@@ -452,6 +456,14 @@ def inception_feats(model, images_uint8, device, batch=64):
 
 def cmd_refstats(a):
     rank, world = _shard_id()
+    # Same reason as cmd_pixels: skip before paying for the download. Only
+    # possible when --n is given, because otherwise the output filename depends
+    # on len(ds); without it we fall through to the check below.
+    if a.n and not a.refresh:
+        guess = f"{a.dest}/ref_{a.resolution}_{a.n}.npz"
+        if os.path.exists(guess):
+            print(f"[refstats] {guess} exists; nothing to do (use --refresh)")
+            return
     ds = image_source(a.source, a.resolution)
     n = min(a.n, len(ds)) if a.n else len(ds)
     os.makedirs(a.dest, exist_ok=True)
